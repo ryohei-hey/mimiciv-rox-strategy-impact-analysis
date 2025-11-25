@@ -1,0 +1,1221 @@
+---
+title: "HFNC Data Extraction - Part 1: Basic patient hourly data"
+author: "Ryohei"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+---
+
+# Document Overview
+
+## Purpose
+This document constructs a **person-hourly dataset** for analyzing High-Flow Nasal Cannula (HFNC) therapy outcomes in the MIMIC-IV database. The dataset contains one row per patient per hour from ICU admission through 30 days (720 hours) after HFNC initiation.
+
+## What This File Does
+
+### Primary Objectives
+1. **Identify HFNC patients** meeting specific inclusion/exclusion criteria
+2. **Create time-indexed data structure** expanding each patient's timeline into hourly observations
+3. **Establish baseline cohort** for subsequent clinical variable extraction (completed in separate files)
+
+### Key Outputs
+- **`person_hourly_censored`**: Final person-hourly dataset (main output)
+  - One row per patient per hour
+  - Covers ICU admission → 720 hours post-HFNC start
+  - Censored at death (no post-death observations)
+  - Contains patient identifiers, time variables, and basic outcomes
+
+- **`hfnc_cohort_final`**: Patient-level cohort table
+  - One row per patient
+  - Includes HFNC start time, ICU admission time, demographics
+
+- **`flow_diagram_numbers.rds`**: Inclusion/exclusion flow diagram data
+  - Records patient counts at each selection step
+  - Used for CONSORT diagram generation
+
+### Processing Steps Summary
+
+| Step | Description | Key Output Table |
+|------|-------------|------------------|
+| 1 | Retrieve basic ICU stay information | `icu_stays_base` |
+| 2 | Extract ventilator data (Invasive/Noninvasive/HighFlow) | `invasive_noninvasive_highflow` |
+| 3 | Identify first HFNC episode per ICU stay | `first_hfnc_episode` |
+| 4 | Create code status table for exclusion criteria | `derived_code_status` |
+| 5 | Apply inclusion/exclusion criteria sequentially | `hfnc_cohort_final` |
+| 6 | Generate time array (0 to 720h after HFNC) | `time_array_generated` |
+| 7 | Expand to person-hourly format (unnest array) | `person_hourly_with_time` |
+| 8 | Calculate death and discharge outcomes | `person_hourly_with_outcomes` |
+| 9 | Exclude data after death (censoring) | `person_hourly_censored` |
+
+### Inclusion Criteria
+- First ICU admission only
+- Age 18-85 years
+- Non-neurological ICU
+- HFNC initiated within -1 to +∞ hours of ICU admission
+
+### Exclusion Criteria
+- HFNC start before -1 hour of ICU admission
+- Invasive ventilation within 24 hours before HFNC
+- DNR/DNI/CMO order before HFNC start
+- Death before HFNC start
+
+### Time Variables
+- **`hr`**: Hours since ICU admission (always ≥ 0)
+- **`time`**: Hours since HFNC start (can be negative if HFNC started before ICU admission)
+- **`hr_at_hfnc_start`**: ICU admission hour when HFNC started
+
+### Subsequent Analysis Files
+After this file creates the baseline person-hourly structure:
+- **File 02**: Extract hourly clinical variables (vitals, labs, ventilator settings)
+- **File 03**: Calculate time-varying covariates and outcomes
+
+---
+
+# Setup
+
+## Overview
+This analysis uses **R combined with SQL** through the DuckDB database interface. The code structure integrates:
+
+- **R functions** for data manipulation and visualization (via `tidyverse`)
+- **SQL queries** for efficient database operations (via `duckdb`)
+- **Database interface** through the `DBI` package
+
+### Code Structure Pattern
+Throughout this document, you'll see this pattern:
+
+```r
+dbGetQuery(con, "       # ← R function call (DBI package)
+  SELECT ...            # ← SQL query begins here
+  FROM ...
+  WHERE ...
+")                       # ← End of SQL query string
+```
+
+### Packages Used
+- **duckdb**: In-process SQL OLAP database management system
+- **tidyverse**: Collection of R packages for data science (dplyr, ggplot2, etc.)
+- **here**: Simple way to construct file paths relative to project root
+
+### Database Connection
+We connect to a pre-built DuckDB database containing MIMIC-IV tables. The connection object `con` is used throughout this script to execute SQL queries.
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(duckdb)
+library(tidyverse)
+library(here)
+
+# Path to DuckDB file (normalized Windows path)
+db_path <- here("data", "mimic.duckdb")
+
+# Connect to DuckDB
+# read_only = FALSE allows table creation and modifications
+con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = FALSE)
+
+# Check available tables
+tables <- dbListTables(con)
+cat("Number of available tables:", length(tables), "\n")
+head(tables, 20)
+
+```
+
+## Database Verification
+
+```{r check-tables}
+# Check row counts for each table
+dbGetQuery(con, "
+  SELECT 'hosp_patients' as table_name, COUNT(*) as row_count FROM hosp_patients
+  UNION ALL
+  SELECT 'hosp_admissions', COUNT(*) FROM hosp_admissions
+  UNION ALL
+  SELECT 'icu_icustays', COUNT(*) FROM icu_icustays
+  UNION ALL
+  SELECT 'icu_chartevents', COUNT(*) FROM icu_chartevents
+")
+```
+
+# Phase 1: Basic Structure and HFNC Patient Selection
+
+## Step 1: Retrieve Basic ICU Stay Information
+
+### Purpose
+Join the patients, admissions, and icustays tables to retrieve all ICU stay data for each patient. This serves as the foundational table for all subsequent analyses.
+
+### Processing Details
+- INNER JOIN three tables
+- Retrieve necessary basic information for each ICU stay (demographics, admission info, ICU info)
+- Do not filter by HFNC yet (target all ICU stays)
+
+### Query Execution
+
+```{r step1-create-table}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE icu_stays_base AS
+  SELECT
+      p.subject_id,
+      p.gender,
+      p.anchor_age,
+      p.anchor_year,
+      p.anchor_year_group,
+      p.dod,  -- 追加
+      a.hadm_id,
+      a.admittime,
+      a.dischtime,
+      a.deathtime,
+      a.admission_type,
+      a.admission_location,
+      a.discharge_location,
+      a.insurance,
+      a.language,
+      a.marital_status,
+      a.race as ethnicity,
+      i.stay_id,
+      i.first_careunit,
+      i.last_careunit,
+      i.intime,
+      i.outtime,
+      i.los
+  FROM hosp_patients p
+  INNER JOIN hosp_admissions a
+      ON p.subject_id = a.subject_id
+  INNER JOIN icu_icustays i
+      ON a.hadm_id = i.hadm_id
+  ORDER BY p.subject_id, a.hadm_id, i.stay_id
+")
+
+print("✓ Created table icu_stays_base")
+```
+
+## Step 2: Extract Ventilator Data (Invasive/Noninvasive/HighFlow)
+
+### Purpose
+Extract three types of ventilator data, retrieving start and end time pairs.
+
+### Ventilator Types to Extract
+- **Invasive**: Mechanical ventilation via endotracheal intubation (itemid: 225792)
+- **Noninvasive**: Mask ventilation such as BiPAP/CPAP (itemid: 225794)
+- **HighFlow**: High-flow oxygen therapy (itemid: 226732, value: 'High flow nasal cannula')
+
+### Processing Flow
+1. **Part 1**: Retrieve data from procedureevents and chartevents
+2. **Part 2**: Handle HighFlow continuity within 24 hours
+3. **Part 3**: Process duplicates and gaps (within 6 hours) and consolidate
+
+### Query Execution
+
+```{r step2-create-ventilator-data}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE invasive_noninvasive_highflow AS
+
+  -- Part 1: Retrieve ventilator data from procedureevents and chartevents
+  WITH procedure_derived AS (
+      SELECT
+          stay_id,
+          starttime,
+          endtime,
+          CASE itemid
+              WHEN 225792 THEN 'Invasive'
+              WHEN 225794 THEN 'Noninvasive'
+          END AS ventilation_status
+      FROM icu_procedureevents
+      WHERE itemid IN (225792, 225794)
+  ),
+  
+  highflow AS (
+      SELECT
+          stay_id,
+          charttime,
+          CASE
+              WHEN value = 'High flow nasal cannula' THEN 'HighFlow'
+              ELSE NULL
+          END AS ventilation_status
+      FROM icu_chartevents
+      WHERE itemid = 226732
+      AND value = 'High flow nasal cannula'
+  ),
+
+  -- Process HighFlow continuity (gaps within 24 hours are considered continuous)
+  highflow_overstay AS (
+      SELECT
+          stay_id,
+          ventilation_status,
+          charttime,
+          LAG(charttime) OVER(PARTITION BY stay_id ORDER BY charttime ASC) AS previous_time
+      FROM highflow
+  ),
+  
+  highflow_overstay2 AS (
+      SELECT
+          stay_id,
+          ventilation_status,
+          charttime,
+          previous_time,
+          CAST(EXTRACT(EPOCH FROM (charttime - previous_time)) / 3600 AS INTEGER) AS difference
+      FROM highflow_overstay
+  ),
+  
+  highflow_gap AS (
+      SELECT *,
+          CASE WHEN difference > 24 THEN 1 ELSE 0 END as temp
+      FROM highflow_overstay2
+  ),
+  
+  highflow_gap2 AS (
+      SELECT *,
+          SUM(temp) OVER(PARTITION BY stay_id ORDER BY charttime) AS g
+      FROM highflow_gap
+  ),
+  
+  highflow_final AS (
+      SELECT
+          stay_id,
+          ventilation_status,
+          MIN(charttime) AS starttime,
+          MAX(charttime) AS endtime
+      FROM highflow_gap2
+      WHERE ventilation_status IS NOT NULL
+      GROUP BY stay_id, ventilation_status, g
+  ),
+  
+  vent_and_hf AS (
+      SELECT
+          CAST(stay_id as BIGINT) AS stay_id,
+          starttime,
+          endtime,
+          ventilation_status
+      FROM procedure_derived
+      
+      UNION ALL
+      
+      SELECT
+          CAST(stay_id as BIGINT) AS stay_id,
+          CAST(starttime as TIMESTAMP),
+          CAST(endtime as TIMESTAMP),
+          ventilation_status
+      FROM highflow_final
+      WHERE starttime != endtime
+  ),
+
+  -- Part 2: Process data duplicates and gaps
+  creating_lag_lead AS (
+      SELECT
+          stay_id,
+          starttime,
+          endtime,
+          ventilation_status,
+          LAG(ventilation_status) OVER(PARTITION BY stay_id ORDER BY starttime ASC) AS previous_status,
+          LAG(endtime) OVER(PARTITION BY stay_id ORDER BY starttime ASC) AS previous_time,
+          LEAD(ventilation_status) OVER(PARTITION BY stay_id ORDER BY starttime ASC) AS next_status,
+          LEAD(starttime) OVER(PARTITION BY stay_id ORDER BY starttime ASC) AS next_time,
+          LEAD(endtime) OVER(PARTITION BY stay_id ORDER BY starttime ASC) AS next_endtime,
+          ROW_NUMBER() OVER (ORDER BY stay_id, starttime) AS row_num
+      FROM vent_and_hf
+      ORDER BY stay_id, starttime
+  ),
+  
+  combine_same_treatment_step1 AS (
+      SELECT
+          stay_id,
+          ROW_NUMBER() OVER(PARTITION BY stay_id, ventilation_status ORDER BY starttime) AS row_number
+      FROM creating_lag_lead
+      WHERE (previous_status = ventilation_status AND previous_time > starttime)
+      OR (next_status = ventilation_status AND next_time < endtime)
+  ),
+  
+  combine_same_treatment_step2 AS (
+      SELECT *,
+          CASE WHEN previous_time < starttime THEN 1 ELSE 0 END as ind
+      FROM creating_lag_lead
+      WHERE stay_id IN (
+          SELECT DISTINCT(stay_id)
+          FROM combine_same_treatment_step1
+          WHERE row_number > 2
+      )
+      AND ((previous_status = ventilation_status AND previous_time > starttime)
+      OR (next_status = ventilation_status AND next_time < endtime))
+  ),
+  
+  combine_same_treatment_step3 AS (
+      SELECT *,
+          SUM(ind) OVER (PARTITION BY stay_id ORDER BY starttime) as g
+      FROM combine_same_treatment_step2
+  ),
+  
+  combine_same_treatment_step4 AS (
+      SELECT
+          stay_id,
+          starttime,
+          endtime,
+          ventilation_status,
+          FIRST_VALUE(previous_status) OVER (PARTITION BY stay_id, g ORDER BY starttime) as previous_status,
+          FIRST_VALUE(previous_time) OVER (PARTITION BY stay_id, g ORDER BY starttime) as previous_time,
+          LAST_VALUE(next_status) OVER (PARTITION BY stay_id, g ORDER BY starttime 
+              ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as next_status,
+          LAST_VALUE(next_time) OVER (PARTITION BY stay_id, g ORDER BY starttime 
+              ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as next_time,
+          LAST_VALUE(next_endtime) OVER (PARTITION BY stay_id, g ORDER BY starttime 
+              ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as next_endtime,
+          g
+      FROM combine_same_treatment_step3
+  ),
+  
+  combine_same_treatment_step5 AS (
+      SELECT
+          stay_id,
+          MIN(starttime) as starttime,
+          MAX(endtime) as endtime,
+          MIN(ventilation_status) as ventilation_status,
+          MIN(previous_status) as previous_status,
+          MIN(previous_time) as previous_time,
+          MAX(next_status) as next_status,
+          MAX(next_time) as next_time,
+          MAX(next_endtime) as next_endtime
+      FROM combine_same_treatment_step4
+      GROUP BY stay_id, g
+      
+      UNION ALL
+      
+      SELECT
+          stay_id,
+          starttime,
+          endtime,
+          ventilation_status,
+          previous_status,
+          previous_time,
+          next_status,
+          next_time,
+          next_endtime
+      FROM creating_lag_lead
+      WHERE row_num NOT IN (SELECT row_num FROM combine_same_treatment_step2)
+  ),
+
+  -- Part 3: Fill gaps within 6 hours
+  close_gap_cutoff_overlap AS (
+      SELECT
+          stay_id,
+          starttime,
+          endtime,
+          ventilation_status,
+          CASE
+              WHEN ventilation_status = 'HighFlow'
+                  AND previous_status IN ('Invasive','Noninvasive')
+                  AND previous_time IS NOT NULL
+                  AND CAST(EXTRACT(EPOCH FROM (starttime - previous_time)) / 3600 AS INTEGER) < 6
+              THEN previous_time
+              WHEN ventilation_status = 'Noninvasive'
+                  AND previous_status = 'Invasive'
+                  AND previous_time IS NOT NULL
+                  AND CAST(EXTRACT(EPOCH FROM (starttime - previous_time)) / 3600 AS INTEGER) < 6
+              THEN previous_time
+          END as starttime_new,
+          CASE
+              WHEN ventilation_status = 'HighFlow'
+                  AND next_status IN ('Invasive','Noninvasive')
+                  AND next_time IS NOT NULL
+                  AND CAST(EXTRACT(EPOCH FROM (next_time - endtime)) / 3600 AS INTEGER) < 6
+              THEN next_time
+              WHEN ventilation_status = 'Noninvasive'
+                  AND next_status = 'Invasive'
+                  AND next_time IS NOT NULL
+                  AND CAST(EXTRACT(EPOCH FROM (next_time - endtime)) / 3600 AS INTEGER) < 6
+              THEN next_time
+          END as endtime_new
+      FROM combine_same_treatment_step5
+  ),
+  
+  new_time AS (
+      SELECT
+          stay_id,
+          ventilation_status,
+          COALESCE(starttime_new, starttime) as starttime,
+          COALESCE(endtime_new, endtime) as endtime
+      FROM close_gap_cutoff_overlap
+  )
+  
+  SELECT * FROM new_time
+  WHERE starttime <= endtime  -- ← Added this line (exclude invalid data)
+  ORDER BY stay_id, starttime
+")
+
+print("✓ Created table invasive_noninvasive_highflow")
+```
+
+
+## Step 3: Identify First HFNC Episode
+
+### Purpose
+Identify the first HFNC start time for each ICU stay and define it as time 0 (observation starting point).
+
+### Processing Details
+- Extract records with `ventilation_status = 'HighFlow'` from `invasive_noninvasive_highflow`
+- Identify the first HFNC start time (MIN(starttime)) for each stay_id
+- Join with ICU admission time (intime) to calculate time from ICU admission to HFNC start
+
+### Query Execution
+
+```{r step3-create-table}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE first_hfnc_episode AS
+  SELECT
+      v.stay_id,
+      i.subject_id,
+      i.hadm_id,
+      i.intime,
+      i.outtime,
+      MIN(v.starttime) as first_hfnc_start,
+      CAST(FLOOR(EXTRACT(EPOCH FROM (MIN(v.starttime) - i.intime)) / 3600) AS INTEGER) as hr_at_hfnc_start
+  FROM invasive_noninvasive_highflow v
+  INNER JOIN icu_icustays i
+      ON v.stay_id = i.stay_id
+  WHERE v.ventilation_status = 'HighFlow'
+  GROUP BY v.stay_id, i.subject_id, i.hadm_id, i.intime, i.outtime
+  ORDER BY v.stay_id
+")
+
+print("✓ Created table first_hfnc_episode")
+```
+
+
+## Step 4: Create derived_code_status
+
+### Purpose
+Extract Code Status records before applying exclusion criteria to create the derived_code_status table for subsequent use.
+
+### Processing Details
+- Extract Code Status records from chartevents (itemids: 223758, 228687)
+- Extract Code Status records from POE (Provider Order Entry)
+- Consolidate both sources into a single table
+- This table will be used for exclusion criterion 5 and for creating hourly Code Status variables in file 02
+
+### Query Execution
+
+```{r step4-derived-code-status}
+# Extract Code Status from chartevents
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_chartevents AS
+  SELECT
+      ce.subject_id,
+      ce.hadm_id,
+      ce.stay_id,
+      ce.charttime,
+      CASE WHEN ce.value = 'Full code' THEN 1 ELSE 0 END AS fullcode,
+      CASE WHEN ce.value = 'Comfort measures only' THEN 1 ELSE 0 END AS cmo,
+      CASE WHEN ce.value IN ('DNI (do not intubate)', 'DNR / DNI') THEN 1 ELSE 0 END AS dni,
+      CASE WHEN ce.value IN ('DNR (do not resuscitate)', 'DNR / DNI') THEN 1 ELSE 0 END AS dnr,
+      CASE WHEN ce.value = 'DNR / DNI' THEN 1 ELSE 0 END AS dnr_dni
+  FROM icu_chartevents ce
+  WHERE ce.itemid IN (223758, 228687)
+      AND ce.stay_id IS NOT NULL
+      AND ce.value IS NOT NULL
+")
+
+# Extract Code Status from POE (Provider Order Entry)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_poe AS
+  SELECT 
+      p.subject_id,
+      p.hadm_id,
+      ie.stay_id,
+      p.ordertime AS charttime,
+      CASE
+          WHEN pd.field_value IN (
+              'Resuscitate (Full code)',
+              'Full code  (attempt resuscitation)'
+          ) THEN 1 ELSE 0 
+      END AS fullcode,
+      0 AS cmo,
+      CASE WHEN pd.field_value = 'Do not resuscitate (DNR/DNI)' THEN 1 ELSE 0 END AS dni,
+      CASE
+          WHEN pd.field_value IN (
+              'DNAR (DO NOT attempt resuscitation for cardiac arrest) ',
+              'Do not resuscitate (DNR/DNI)'
+          ) THEN 1 ELSE 0 
+      END AS dnr,
+      CASE WHEN pd.field_value = 'Do not resuscitate (DNR/DNI)' THEN 1 ELSE 0 END AS dnr_dni
+  FROM hosp_poe p
+  INNER JOIN hosp_poe_detail pd
+      ON p.poe_id = pd.poe_id
+  LEFT JOIN icu_icustays ie
+      ON p.hadm_id = ie.hadm_id
+      AND p.ordertime >= ie.intime
+      AND p.ordertime <= ie.outtime
+  WHERE p.order_type = 'General Care'
+      AND p.order_subtype = 'Code status'
+      AND ie.stay_id IS NOT NULL
+")
+
+# Consolidate both sources
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_code_status AS
+  SELECT subject_id, hadm_id, stay_id, charttime, fullcode, cmo, dni, dnr, dnr_dni
+  FROM code_status_chartevents
+  UNION ALL
+  SELECT subject_id, hadm_id, stay_id, charttime, fullcode, cmo, dni, dnr, dnr_dni
+  FROM code_status_poe
+")
+
+# Clean up temporary tables
+dbExecute(con, "DROP TABLE IF EXISTS code_status_chartevents")
+dbExecute(con, "DROP TABLE IF EXISTS code_status_poe")
+
+cat("✓ Created derived_code_status\n")
+
+# Check basic statistics
+code_status_stats <- dbGetQuery(con, "
+  SELECT 
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_stays,
+      SUM(fullcode) as n_fullcode,
+      SUM(cmo) as n_cmo,
+      SUM(dni) as n_dni,
+      SUM(dnr) as n_dnr,
+      SUM(dnr_dni) as n_dnr_dni
+  FROM derived_code_status
+")
+
+cat("\n【derived_code_status Basic Statistics】\n")
+print(code_status_stats)
+cat("\n")
+```
+
+
+## Step 5: Apply Inclusion and Exclusion Criteria
+
+### Purpose
+Apply inclusion and exclusion criteria sequentially and record the number of patients excluded at each stage (for Flow diagram creation).
+
+### Inclusion Criteria
+1. First ICU admission only (if multiple ICU admissions, only the first)
+2. Age 18-85 years
+3. Non-Neuro ICU admission (different respiratory management purposes)
+
+### Exclusion Criteria
+1. HFNC start before -1 hour
+2. Invasive ventilation use within 24 hours before HFNC start
+3. DNR/DNI/CMO order before HFNC start
+4. Death before HFNC start
+
+### Recording for Flow Diagram
+
+```{r step5-init}
+# Initialize list for flow diagram
+flow <- list()
+
+# Entire database
+flow$total_icu_stays <- dbGetQuery(con, "SELECT COUNT(*) as n FROM icu_stays_base")$n
+flow$hfnc_icu_stays <- dbGetQuery(con, "SELECT COUNT(*) as n FROM first_hfnc_episode")$n
+
+cat("=== Entire Database ===\n")
+cat(sprintf("Total ICU stays: %s\n", format(flow$total_icu_stays, big.mark=",")))
+cat(sprintf("HFNC-using ICU stays: %s\n\n", format(flow$hfnc_icu_stays, big.mark=",")))
+```
+
+### Inclusion Criterion 1: First ICU Admission Only
+
+```{r step5-inclusion1}
+# Keep only the first ICU stay for each subject_id
+dbExecute(con, "
+  CREATE OR REPLACE TABLE inclusion_step1 AS
+  SELECT
+      f.*,
+      ROW_NUMBER() OVER (PARTITION BY f.subject_id ORDER BY f.stay_id) as icu_admission_number
+  FROM first_hfnc_episode f
+")
+
+flow$after_first_icu <- dbGetQuery(con,
+  "SELECT COUNT(*) as n FROM inclusion_step1 WHERE icu_admission_number = 1")$n
+
+flow$excluded_multiple_icu <- flow$hfnc_icu_stays - flow$after_first_icu
+
+cat("=== Inclusion Criterion 1: First ICU Admission Only ===\n")
+cat(sprintf("Remaining: %s\n", format(flow$after_first_icu, big.mark=",")))
+cat(sprintf("Excluded: %s\n\n", format(flow$excluded_multiple_icu, big.mark=",")))
+```
+
+### Inclusion Criterion 2: Age 18-85 Years
+
+```{r step5-inclusion2}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE inclusion_step2 AS
+  SELECT
+      i.*,
+      b.anchor_age,
+      b.anchor_year,
+      -- Calculate actual age at ICU admission
+      (b.anchor_age + (EXTRACT(YEAR FROM b.intime) - b.anchor_year)) AS age_at_icu_admission
+  FROM inclusion_step1 i
+  INNER JOIN icu_stays_base b
+      ON i.stay_id = b.stay_id
+  WHERE i.icu_admission_number = 1
+      -- Filter by actual age at ICU admission (corrected)
+      AND (b.anchor_age + (EXTRACT(YEAR FROM b.intime) - b.anchor_year)) >= 18
+      AND (b.anchor_age + (EXTRACT(YEAR FROM b.intime) - b.anchor_year)) <= 85
+")
+
+flow$after_age_filter <- dbGetQuery(con, "SELECT COUNT(*) as n FROM inclusion_step2")$n
+flow$excluded_age <- flow$after_first_icu - flow$after_age_filter
+
+cat(sprintf("Remaining: %s\n", format(flow$after_age_filter, big.mark=",")))
+cat(sprintf("Excluded: %s\n\n", format(flow$excluded_age, big.mark=",")))
+```
+
+### Inclusion Criterion 3: Exclude Neuro ICU
+
+```{r step5-inclusion3}
+# Exclude Neuro ICU (different respiratory management purposes)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE inclusion_step3 AS
+  SELECT i.*
+  FROM inclusion_step2 i
+  INNER JOIN icu_stays_base b
+      ON i.stay_id = b.stay_id
+  WHERE b.first_careunit NOT IN (
+      'Neuro Intermediate',
+      'Neuro Surgical Intensive Care Unit (Neuro SICU)',
+      'Neuro Stepdown'
+  )
+")
+
+flow$after_icu_type_filter <- dbGetQuery(con, "SELECT COUNT(*) as n FROM inclusion_step3")$n
+flow$excluded_neuro_icu <- flow$after_age_filter - flow$after_icu_type_filter
+
+cat("=== Inclusion Criterion 3: Exclude Neuro ICU ===\n")
+cat(sprintf("Remaining: %s\n", format(flow$after_icu_type_filter, big.mark=",")))
+cat(sprintf("Excluded: %s (Neuro Intermediate, Neuro SICU, Neuro Stepdown)\n\n",
+            format(flow$excluded_neuro_icu, big.mark=",")))
+```
+
+### Exclusion Criterion 1: HFNC Start Before -1 Hour
+Including the period up to one hour before admission is to incorporate HFNC use immediately prior to ICU admission (allowing for placement in the ED or for transport to the ICU).
+
+```{r step5-exclusion1}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE exclusion_step1 AS
+  SELECT * FROM inclusion_step3
+  WHERE hr_at_hfnc_start >= -1
+")
+
+flow$after_excl_early_hfnc <- dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step1")$n
+flow$excluded_early_hfnc <- flow$after_icu_type_filter - flow$after_excl_early_hfnc
+
+cat("=== Exclusion Criterion 1: HFNC Start Before -1 Hour ===\n")
+cat(sprintf("Remaining: %s\n", format(flow$after_excl_early_hfnc, big.mark=",")))
+cat(sprintf("Excluded: %s\n\n", format(flow$excluded_early_hfnc, big.mark=",")))
+```
+
+### Exclusion Criterion 2: Invasive Ventilation Use Within 24 Hours Before HFNC Start
+  
+HFNC is used for two purposes. One is to avoid intubation in cases of respiratory failure (where the patient has not yet been intubated), and the other is as support after extubation. The latter is medically distinct and will be excluded.  
+
+```{r step5-exclusion2}
+# Identify patients who used invasive ventilation within 24 hours before HFNC start
+dbExecute(con, "
+  CREATE OR REPLACE TABLE invasive_before_hfnc AS
+  SELECT DISTINCT e.stay_id
+  FROM exclusion_step1 e
+  INNER JOIN invasive_noninvasive_highflow v
+      ON e.stay_id = v.stay_id
+  WHERE v.ventilation_status = 'Invasive'
+      AND v.starttime < e.first_hfnc_start
+      AND (
+          v.endtime IS NULL 
+          OR 
+          CAST(EXTRACT(EPOCH FROM (e.first_hfnc_start - v.endtime)) / 3600 AS NUMERIC) < 24
+      )
+")
+
+dbGetQuery(con, "SELECT COUNT(*) as n FROM invasive_before_hfnc")
+
+# Exclude these patients
+dbExecute(con, "
+  CREATE OR REPLACE TABLE exclusion_step2 AS
+  SELECT e.*
+  FROM exclusion_step1 e
+  WHERE e.stay_id NOT IN (SELECT stay_id FROM invasive_before_hfnc)
+")
+
+dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step2")
+
+flow$after_excl_invasive <- dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step2")$n
+flow$excluded_invasive_24h <- flow$after_excl_early_hfnc - flow$after_excl_invasive
+
+cat("=== Exclusion Criterion 2: Invasive Ventilation Within 24h Before HFNC ===\n")
+cat(sprintf("Remaining: %s\n", format(flow$after_excl_invasive, big.mark=",")))
+cat(sprintf("Excluded: %s\n\n", format(flow$excluded_invasive_24h, big.mark=",")))
+```
+
+### Exclusion Criterion 3: DNR/DNI/CMO Order Before HFNC Start
+
+Exclude patients who had any DNR/DNI/CMO order between ICU admission and HFNC start. Keep patients who only had Full Code status (or no Code Status records).
+
+```{r step5-exclusion3_1}
+# Identify patients with exclusion-eligible Code Status between ICU admission and HFNC start
+# Stage 1: Identify patients with Code Status within 1 hour after HFNC start
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_exclusion_1 AS
+  SELECT DISTINCT 
+      cs.stay_id,
+      MAX(cs.dnr) as had_dnr,
+      MAX(cs.dni) as had_dni,
+      MAX(cs.dnr_dni) as had_dnr_dni,
+      MAX(cs.cmo) as had_cmo,
+      'Within 1h after HFNC' as exclusion_reason
+  FROM derived_code_status cs
+  INNER JOIN exclusion_step2 e
+      ON cs.stay_id = e.stay_id
+  WHERE cs.charttime <= e.first_hfnc_start + INTERVAL '1 hour'
+      AND (cs.dnr = 1 OR cs.dni = 1 OR cs.dnr_dni = 1 OR cs.cmo = 1)
+  GROUP BY cs.stay_id
+")
+
+# Check stage 1 exclusion count
+excluded_1 <- dbGetQuery(con, "SELECT COUNT(*) as n FROM code_status_exclusion_1")
+cat("Stage 1 exclusion count (Within 1h after HFNC):", excluded_1$n, "cases\n")
+```
+```{r}
+# Stage 2: Identify patients with Code Status after ICU admission (excluding stage 1 patients)
+# Option A: Within 1 hour after ICU admission (recommended)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_exclusion_2 AS
+  SELECT DISTINCT
+      cs.stay_id,
+      MAX(cs.dnr) as had_dnr,
+      MAX(cs.dni) as had_dni,
+      MAX(cs.dnr_dni) as had_dnr_dni,
+      MAX(cs.cmo) as had_cmo,
+      'Within 1h after ICU admission' as exclusion_reason
+  FROM derived_code_status cs
+  INNER JOIN exclusion_step2 e
+      ON cs.stay_id = e.stay_id
+  INNER JOIN icu_icustays ie
+      ON cs.stay_id = ie.stay_id
+  WHERE cs.charttime >= ie.intime
+      AND cs.charttime <= ie.intime + INTERVAL '1 hour'
+      AND (cs.dnr = 1 OR cs.dni = 1 OR cs.dnr_dni = 1 OR cs.cmo = 1)
+      AND cs.stay_id NOT IN (SELECT stay_id FROM code_status_exclusion_1)
+  GROUP BY cs.stay_id
+")
+
+# Check stage 2 exclusion count
+excluded_2 <- dbGetQuery(con, "SELECT COUNT(*) as n FROM code_status_exclusion_2")
+cat("Stage 2 exclusion count (Within 1h after ICU admission):", excluded_2$n, "cases\n")
+
+
+```
+
+
+```{r step5-exclusion3_3_1}
+# Exclude these patients
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_before_hfnc AS
+  SELECT * FROM code_status_exclusion_1
+  UNION
+  SELECT * FROM code_status_exclusion_2
+")
+
+# Total exclusion count after consolidation
+total_excluded <- dbGetQuery(con, "SELECT COUNT(*) as n FROM code_status_before_hfnc")
+cat("Total exclusion count:", total_excluded$n, "cases\n")
+```
+
+
+```{r step5-exclusion3_3_2}
+# Execute final exclusion
+dbExecute(con, "
+  CREATE OR REPLACE TABLE exclusion_step3 AS
+  SELECT e.*
+  FROM exclusion_step2 e
+  WHERE e.stay_id NOT IN (SELECT stay_id FROM code_status_before_hfnc)
+")
+
+# Final remaining count
+remaining <- dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step3")
+cat("Remaining patients:", remaining$n, "cases\n")
+```
+
+
+```{r step5-exclusion3_3_3}
+cat("\n=== Exclusion Flow Verification ===\n")
+cat("exclusion_step2:",
+    dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step2")$n, "cases\n")
+cat("→ Stage 1 exclusion:", excluded_1$n, "cases\n")
+cat("→ Stage 2 exclusion:", excluded_2$n, "cases\n")
+cat("→ Total exclusion:", total_excluded$n, "cases\n")
+cat("→ exclusion_step3:", remaining$n, "cases\n")
+```
+
+
+### Exclusion Criterion 4: Death Before HFNC Start
+
+```{r step5-exclusion4}
+# Exclude patients who died before HFNC start
+dbExecute(con, "
+  CREATE OR REPLACE TABLE exclusion_step4 AS
+  SELECT e.*
+  FROM exclusion_step3 e
+  INNER JOIN icu_stays_base b
+      ON e.stay_id = b.stay_id
+  WHERE b.deathtime IS NULL
+      OR b.deathtime >= e.first_hfnc_start
+")
+
+flow$after_excl_death <- dbGetQuery(con, "SELECT COUNT(*) as n FROM exclusion_step4")$n
+flow$excluded_death_before_hfnc <- flow$after_excl_dni - flow$after_excl_death
+
+cat("=== Exclusion Criterion 4: Death Before HFNC Start ===\n")
+cat(sprintf("Remaining: %s\n", format(flow$after_excl_death, big.mark=",")))
+cat(sprintf("Excluded: %s\n\n", format(flow$excluded_death_before_hfnc, big.mark=",")))
+```
+
+### HFNC Start Time Adjustment and Final Table Creation
+
+```{r step5-final}
+# Adjust HFNC starts between -6 and -1 hours to ICU admission time (0 hours)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE hfnc_cohort_final AS
+  SELECT
+      stay_id,
+      subject_id,
+      hadm_id,
+      intime,
+      outtime,
+      anchor_age,
+      CASE 
+          WHEN hr_at_hfnc_start < 0 AND hr_at_hfnc_start >= -6
+          THEN intime
+          ELSE first_hfnc_start
+      END as first_hfnc_start,
+      CASE 
+          WHEN hr_at_hfnc_start < 0 AND hr_at_hfnc_start >= -6
+          THEN 0
+          ELSE hr_at_hfnc_start
+      END as hr_at_hfnc_start,
+      first_hfnc_start as original_hfnc_start,
+      hr_at_hfnc_start as original_hr_at_hfnc_start
+  FROM exclusion_step4
+")
+
+flow$final_cohort <- dbGetQuery(con, "SELECT COUNT(*) as n FROM hfnc_cohort_final")$n
+
+adjusted_count <- dbGetQuery(con, "
+  SELECT COUNT(*) as n 
+  FROM hfnc_cohort_final 
+  WHERE original_hr_at_hfnc_start < 0
+")$n
+
+cat(sprintf("Patients adjusted to ICU admission time: %s\n", format(adjusted_count, big.mark=",")))
+cat(sprintf("Final cohort size: %s\n\n", format(flow$final_cohort, big.mark=",")))
+```
+
+### Flow Diagram Summary
+
+```{r step5-summary}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("FLOW DIAGRAM SUMMARY\n")
+cat(strrep("=", 60), "\n\n")
+
+cat("Entire Database\n")
+cat(sprintf("  Total ICU stays: %s\n", format(flow$total_icu_stays, big.mark=",")))
+cat(sprintf("  HFNC-using ICU stays: %s\n\n", format(flow$hfnc_icu_stays, big.mark=",")))
+
+cat("Inclusion Criteria\n")
+cat(sprintf("  First ICU admission only: %s (Excluded: %s)\n",
+            format(flow$after_first_icu, big.mark=","),
+            format(flow$excluded_multiple_icu, big.mark=",")))
+cat(sprintf("  Age 18-85 years: %s (Excluded: %s)\n",
+            format(flow$after_age_filter, big.mark=","),
+            format(flow$excluded_age, big.mark=",")))
+cat(sprintf("  Exclude Neuro ICU: %s (Excluded: %s)\n\n",
+            format(flow$after_icu_type_filter, big.mark=","),
+            format(flow$excluded_neuro_icu, big.mark=",")))
+
+cat("Exclusion Criteria\n")
+cat(sprintf("  1. HFNC start before -6 hours: Excluded %s\n",
+            format(flow$excluded_early_hfnc, big.mark=",")))
+cat(sprintf("  2. Invasive ventilation within 24h before HFNC: Excluded %s\n",
+            format(flow$excluded_invasive_24h, big.mark=",")))
+cat(sprintf("  3. DNR/DNI/CMO before HFNC start: Excluded %s\n",
+            format(flow$excluded_code_status, big.mark=",")))
+cat(sprintf("  4. Death before HFNC start: Excluded %s\n\n",
+            format(flow$excluded_death_before_hfnc, big.mark=",")))
+
+cat(sprintf("Final analysis cohort: %s\n\n", format(flow$final_cohort, big.mark=",")))
+
+cat(strrep("=", 60), "\n")
+
+
+# Save flow object
+if (!dir.exists("data")) dir.create("data")
+saveRDS(flow, "data/flow_diagram_numbers.rds")
+cat("\nFlow diagram numbers saved: data/flow_diagram_numbers.rds\n")
+```
+
+## Step 6: Generate Time Array from ICU Admission to 720 Hours After HFNC
+
+### Purpose
+Generate time arrays for each patient from ICU admission (hr=0) to 720 hours after HFNC start.
+
+### Processing Details
+- Retrieve hr_at_hfnc_start for each patient
+- Generate integer array from 0 to (hr_at_hfnc_start + 720)
+- Example: If HFNC starts at hr=6, array from 0 to 726 (727 rows)
+
+### Query Execution
+
+```{r step6-generate-array}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE time_array_generated AS
+  SELECT
+      stay_id,
+      subject_id,
+      hadm_id,
+      intime,
+      outtime,
+      anchor_age,
+      first_hfnc_start,
+      hr_at_hfnc_start,
+      original_hfnc_start,
+      original_hr_at_hfnc_start,
+      -- 0から (hr_at_hfnc_start + 720) までの配列を生成
+      -- LIST関数を使って配列を作成
+      list_transform(
+          range(0, hr_at_hfnc_start + 721), 
+          x -> x
+      ) as hr_array
+  FROM hfnc_cohort_final
+")
+
+cat("✓ Created table time_array_generated\n")
+```
+
+
+## Step 7: Expand to Person-Hourly Format
+
+### Purpose
+UNNEST the time array to expand to 1 row = 1 hour per patient.
+
+### Processing Details
+- UNNEST hr_array
+- Each patient expands to approximately 721-1,500 rows
+- Create two time variables: hr (time since ICU admission) and time (time since HFNC start)
+
+### Query Execution
+
+```{r step7-unnest}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_base AS
+  SELECT
+      stay_id,
+      subject_id,
+      hadm_id,
+      intime,
+      outtime,
+      anchor_age,
+      first_hfnc_start,
+      hr_at_hfnc_start,
+      original_hfnc_start,
+      original_hr_at_hfnc_start,
+      unnest(hr_array) as hr
+  FROM time_array_generated
+")
+
+cat("✓ Created table person_hourly_base\n")
+```
+
+### Add Time Variable
+
+```{r step7-add-time}
+# Calculate time from hr (time since HFNC start)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_time AS
+  SELECT
+      *,
+      hr - hr_at_hfnc_start as time
+  FROM person_hourly_base
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Added time variable\n")
+```
+
+
+## Step 8: Calculate Death and Discharge Outcomes
+
+### Purpose
+Calculate whether death or discharge occurred at each time point (hr) and join to Person-hourly data.
+
+### Processing Details
+1. **30-day mortality outcome**: Time from HFNC start (time=0) to death (in-hospital + post-discharge)
+2. **Consolidate death time**: Capture both in-hospital and post-discharge using COALESCE(deathtime, dod)
+3. **ICU discharge and hospital discharge**: Record both
+
+### Calculate Death Outcomes
+
+```{r step8-death-outcome}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE death_outcome AS
+  SELECT
+      h.stay_id,
+      h.subject_id,
+      h.hadm_id,
+      h.intime,
+      h.first_hfnc_start,
+      a.deathtime as deathtime_inhosp,
+      p.dod,
+      -- Combined in-hospital and post-discharge deaths
+      COALESCE(a.deathtime, p.dod) as death_datetime,
+      -- Determination of Place of Death
+      CASE 
+          WHEN a.deathtime IS NOT NULL THEN 'in_hospital'
+          WHEN p.dod IS NOT NULL THEN 'post_discharge'
+          ELSE NULL
+      END as death_location,
+      -- Time from HFNC initiation to death (in hours)
+      CASE 
+          WHEN COALESCE(a.deathtime, p.dod) IS NOT NULL 
+          THEN CAST(FLOOR(EXTRACT(EPOCH FROM (COALESCE(a.deathtime, p.dod) - h.first_hfnc_start)) / 3600) AS INTEGER)
+          ELSE NULL
+      END as time_to_death,
+      -- Death flag within 30 days (720 hours)
+      CASE 
+          WHEN COALESCE(a.deathtime, p.dod) IS NOT NULL 
+              AND CAST(EXTRACT(EPOCH FROM (COALESCE(a.deathtime, p.dod) - h.first_hfnc_start)) / 3600 AS INTEGER) <= 720
+          THEN 1
+          ELSE 0
+      END as death_30day,
+      -- Time from ICU admission to death (in hours)
+      CASE 
+          WHEN COALESCE(a.deathtime, p.dod) IS NOT NULL 
+          THEN CAST(FLOOR(EXTRACT(EPOCH FROM (COALESCE(a.deathtime, p.dod) - h.intime)) / 3600) AS INTEGER)
+          ELSE NULL
+      END as hr_at_death
+  FROM hfnc_cohort_final h
+  INNER JOIN icu_stays_base b
+      ON h.stay_id = b.stay_id
+  LEFT JOIN hosp_admissions a
+      ON h.hadm_id = a.hadm_id
+  LEFT JOIN hosp_patients p
+      ON h.subject_id = p.subject_id
+")
+
+cat("✓ Created table death_outcome\n")
+```
+
+### Calculate ICU Discharge and Hospital Discharge Outcomes
+
+```{r step8-discharge-outcome}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE discharge_outcome AS
+  SELECT
+      h.stay_id,
+      h.subject_id,
+      h.hadm_id,
+      h.intime,
+      b.outtime as icu_outtime,
+      a.dischtime as hosp_dischtime,
+      -- Time from ICU admission to discharge (hr unit)
+      CAST(FLOOR(EXTRACT(EPOCH FROM (b.outtime - h.intime)) / 3600) AS INTEGER) as hr_at_icu_discharge,
+      -- Time from ICU admission to hospital discharge (hr unit)
+      CAST(FLOOR(EXTRACT(EPOCH FROM (a.dischtime - h.intime)) / 3600) AS INTEGER) as hr_at_hosp_discharge
+  FROM hfnc_cohort_final h
+  INNER JOIN icu_stays_base b
+      ON h.stay_id = b.stay_id
+  LEFT JOIN hosp_admissions a
+      ON h.hadm_id = a.hadm_id
+")
+
+cat("✓ Created table discharge_outcome\n")
+```
+
+### Join Outcomes to Person-Hourly Data
+
+```{r step8-join-outcomes}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_outcomes AS
+  SELECT
+      p.*,
+      d.deathtime_inhosp,
+      d.dod,
+      d.death_datetime,
+      d.death_location,
+      d.time_to_death,
+      d.death_30day,
+      d.hr_at_death,
+      dc.hr_at_icu_discharge,
+      dc.hr_at_hosp_discharge,
+      -- Did death occur at this time point (hr)?
+      CASE WHEN p.hr = d.hr_at_death THEN 1 ELSE 0 END as death_event,
+      -- Did ICU discharge occur at this time point (hr)?
+      CASE WHEN p.hr = dc.hr_at_icu_discharge THEN 1 ELSE 0 END as icu_discharge_event,
+      -- Did hospital discharge occur at this time point (hr)?
+      CASE WHEN p.hr = dc.hr_at_hosp_discharge THEN 1 ELSE 0 END as hosp_discharge_event
+  FROM person_hourly_with_time p
+  LEFT JOIN death_outcome d
+      ON p.stay_id = d.stay_id
+  LEFT JOIN discharge_outcome dc
+      ON p.stay_id = dc.stay_id
+")
+
+cat("✓ Joined outcomes to Person-hourly data\n")
+```
+
+
+## Step 9: Exclude Data After Death
+
+### Purpose
+Remove data rows after the time point when death occurred. Keep data after ICU discharge or hospital discharge.
+
+### Processing Policy
+- Keep data up to and including the hr when death occurred, delete from the next hr onwards
+- Do NOT delete data after ICU discharge or hospital discharge
+- For survivors, keep all data from HFNC start to 720 hours
+
+### Query Execution
+
+```{r step9-exclude-after-death}
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_censored AS
+  
+  WITH sum_death_outcome_per_row AS (
+      SELECT
+          *,
+          SUM(death_event) OVER (PARTITION BY stay_id ORDER BY hr) AS sum_death_outcome
+      FROM person_hourly_with_outcomes
+  ),
+  
+  return_value_from_previous_sum_death_outcome_row AS (
+      SELECT
+          *,
+          LAG(sum_death_outcome, 1) OVER (PARTITION BY stay_id ORDER BY hr) AS sum_death_outcome_lag
+      FROM sum_death_outcome_per_row
+  )
+  
+  SELECT * EXCLUDE(sum_death_outcome, sum_death_outcome_lag)
+  FROM return_value_from_previous_sum_death_outcome_row
+  WHERE sum_death_outcome_lag IS NULL OR sum_death_outcome_lag = 0
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Created table person_hourly_censored\n")
+```
+
+
+
+```{r}
+dbDisconnect(con, shutdown = TRUE)
+
+# Garbage collection (free memory)
+gc()
+
+cat("✓ Closed DuckDB connection\n")
+cat("✓ Freed memory\n")
+```
+

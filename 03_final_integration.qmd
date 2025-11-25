@@ -1,0 +1,1868 @@
+---
+title: "HFNC Data Extraction - Part 3: Final Integration"
+author: "Ryohei"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+---
+
+
+# Phase 3: Integration of Static Variables and Final Processing
+
+# Setup
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(duckdb)
+library(tidyverse)
+library(here)
+
+# Garbage collection (free memory)
+gc()
+
+# Close existing connection if exists
+if (exists("con") && !is.null(con)) {
+  try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+}
+
+# Clean up environment (delete everything except con and library objects)
+rm(list = setdiff(ls(), c("con")))
+
+# Garbage collection (free memory)
+gc()
+
+cat("✓ Cleaned up environment\n")
+cat("✓ Freed memory\n\n")
+
+# DuckDB file path
+db_path <- "C:/Users/ryohe/Dropbox (個人)/Research/mimic_projects/mimic_analysis/data/mimic.duckdb"
+
+# Check file existence
+if (!file.exists(db_path)) {
+  stop("DuckDB file not found: ", db_path)
+}
+
+# Reconnect to DuckDB
+con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = FALSE)
+
+cat("✓ Connected to DuckDB\n")
+cat("  Database path:", db_path, "\n")
+```
+
+## Step 22: Extraction of Elixhauser Comorbidities
+
+### Purpose
+Extract 31 types of Elixhauser comorbidities from ICD-9/10 diagnosis codes and calculate 3 types of scores (van Walraven, SID29, SID30).
+
+### Data Sources
+- `hosp_diagnoses_icd`: Diagnosis codes
+- `hosp_admissions`: Hospital admission information
+- `hfnc_cohort_final`: HFNC cohort (stay_id, hadm_id)
+
+### Processing Steps
+1. Separate ICD-9 and ICD-10 codes
+2. Extract 31 types of comorbidities as binary variables
+3. Aggregate at hadm_id level
+4. Calculate 3 types of scores
+5. Join with stay_id
+
+```{r step22-1-extract-icd}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.1: Extraction of ICD Diagnosis Codes\n")
+cat(strrep("=", 60), "\n")
+
+# Extract diagnosis codes related to HFNC cohort admissions
+# seq_num != 1: Exclude primary diagnosis
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_icd AS
+  SELECT
+      d.hadm_id,
+      d.seq_num,
+      CASE WHEN d.icd_version = 9 THEN d.icd_code ELSE NULL END AS icd9_code,
+      CASE WHEN d.icd_version = 10 THEN d.icd_code ELSE NULL END AS icd10_code
+  FROM hosp_diagnoses_icd d
+  WHERE d.hadm_id IN (SELECT DISTINCT hadm_id FROM hfnc_cohort_final)
+      AND d.seq_num != 1  -- Exclude primary diagnosis
+")
+
+cat("✓ Extracted ICD diagnosis codes\n")
+
+```
+
+
+
+```{r step22-2-elixhauser-flags}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.2: Creation of Elixhauser Comorbidity Flags\n")
+cat(strrep("=", 60), "\n")
+
+# Define 31 types of comorbidities as binary variables
+# Using logic from 11_elixhauser_score.sql
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_eliflg AS
+  SELECT 
+      hadm_id, 
+      seq_num, 
+      icd9_code, 
+      icd10_code,
+      
+      -- 1. CHF: Congestive heart failure
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('39891','40201','40211','40291','40401','40403','40411','40413','40491','40493') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('4254','4255','4256','4257','4258','4259') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('428') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I099','I110','I130','I132','I255','I420','I425','I426','I427','I428','I429','P290') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I43','I50') THEN 1
+          ELSE 0
+      END AS CHF,
+      
+      -- 2. ARRHY: Cardiac arrhythmias
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('42613','42610','42612','99601','99604') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('4260','4267','4269','4270','4271','4272','4273','4274','4276','4277','4278','4279','7850','V450','V533') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I441','I442','I443','I456','I459','R000','R001','R008','T821','Z450','Z950') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I47','I49') THEN 1
+          ELSE 0
+      END AS ARRHY,
+      
+      -- 3. VALVE: Valvular disease
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('0932','7463','7464','7465','7466','V422','V433') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('394','395','396','397','424') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('A520','I098','I091','Q230','Q231','Q232','Q233','Z952','Z953','Z954') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I05','I06','I07','I08','I34','I35','I36','I37','I38','I39') THEN 1
+          ELSE 0
+      END AS VALVE,
+      
+      -- 4. PULMCIRC: Pulmonary circulation disorder
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('4150','4151','4170','4178','4179') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('416') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I280','I288','I289') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('126','127') THEN 1
+          ELSE 0
+      END AS PULMCIRC,
+      
+      -- 5. PERIVASC: Peripheral vascular disorder
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('0930','4373','4431','4432','4433','4434','4435','4436','4437','4438','4439','4471','5571','5579','V434') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('440','441') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I731','I738','I739','I771','I790','I792','K551','K558','K559','Z958','Z959') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I70','171') THEN 1
+          ELSE 0
+      END AS PERIVASC,
+      
+      -- 6. HTN: Hypertension, uncomplicated
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('401') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I10') THEN 1
+          ELSE 0
+      END AS HTN,
+      
+      -- 7. HTNCX: Hypertension, complicated
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('402','403','404','405') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('I11','I12','I13','I15') THEN 1
+          ELSE 0
+      END AS HTNCX,
+      
+      -- 8. PARA: Paralysis
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('3341','3440','3441','3442','3443','3444','3445','3446','3449') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('342','343') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('G041','G114','G801','G802','G830','G831','G832','G833','G834','G839') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('G81','G82') THEN 1
+          ELSE 0
+      END AS PARA,
+      
+      -- 9. NEURO: Other neurological
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('33392') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('3319','3320','3321','3334','3335','3362','3481','3483','7803','7843') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('334','335','340','341','345') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('G254','G255','G312','G318','G319','G931','G934','R470') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('G10','G11','G12','G13','G20','G21','G22','G32','G35','G36','G37','G40','G41','R56') THEN 1
+          ELSE 0
+      END AS NEURO,
+      
+      -- 10. CHRNLUNG: Chronic pulmonary disease
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('4168','4169','5064','5081','5088') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('490','491','492','493','494','495','496','497','498','499','500','501','502','503','504','505') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I278','I279','J684','J701','J703') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('J40','J41','J42','J43','J44','J45','J46','J47','J60','J61','J62','J63','J64','J65','J66','J67') THEN 1
+          ELSE 0
+      END AS CHRNLUNG,
+      
+      -- 11. DM: Diabetes w/o chronic complications
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2500','2501','2502','2503') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('E100','E101','E109','E110','E111','E119','E120','E121','E12.9','E130','E131','E139','E140','E141','E149') THEN 1
+          ELSE 0
+      END AS DM,
+      
+      -- 12. DMCX: Diabetes w/ chronic complications
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2504','2505','2506','2507','2508','2509') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('E102','E103','E104','E105','E106','E107','E108',
+                                            'E112','E113','E114','E115','E116','E117','E118',
+                                            'E122','E123','E124','E125','E126','E127','E128',
+                                            'E132','E133','E134','E135','E136','E137','E138',
+                                            'E142','E143','E144','E145','E146','E147','E148') THEN 1
+          ELSE 0
+      END AS DMCX,
+      
+      -- 13. HYPOTHY: Hypothyroidism
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2409','2461','2468') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('243','244') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('E890') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('E00','E01','E02','E03') THEN 1
+          ELSE 0
+      END AS HYPOTHY,
+      
+      -- 14. RENLFAIL: Renal failure
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('40301','40311','40391','40402','40403','40412','40413','40492','40493') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('5880','V420','V451') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('585','586','V56') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I120','I131','N250','Z490','Z491','Z492','Z940','Z992') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('N18','N19') THEN 1
+          ELSE 0
+      END AS RENLFAIL,
+      
+      -- 15. LIVER: Liver disease
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('07022','07023','07032','07033','07044','07054') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('0706','0709','4560','4561','4562','5722','5723','5724','5725','5726','5727','5728','5733','5734','5738','5739','V427') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('570','571') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('I864','I982','K711','K713','K714','K715','K717','K760','K762','K763','K764','K765','K766','K767','K768','K769','Z944') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('B18','I85','K70','K72','K73','K74') THEN 1
+          ELSE 0
+      END AS LIVER,
+      
+      -- 16. ULCER: Chronic Peptic ulcer disease
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('5317','5319','5327','5329','5337','5339','5347','5349') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('K257','K259','K267','K269','K277','K279','K287','K289') THEN 1
+          ELSE 0
+      END AS ULCER,
+      
+      -- 17. AIDS: HIV and AIDS
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('042','043','044') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('B20','B21','B22','B24') THEN 1
+          ELSE 0
+      END AS AIDS,
+      
+      -- 18. LYMPH: Lymphoma
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2030','2386') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('200','201','202') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('C900','C902') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('C81','C82','C83','C84','C85','C85','C88','C96') THEN 1
+          ELSE 0
+      END AS LYMPH,
+      
+      -- 19. METS: Metastatic cancer
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('196','197','198','199') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('C77','C78','C79','C80') THEN 1
+          ELSE 0
+      END AS METS,
+      
+      -- 20. TUMOR: Solid tumor without metastasis
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 3) IN (
+              '140','141','142','143','144','145','146','147','148','149','150','151','152',
+              '153','154','155','156','157','158','159','160','161','162','163','164','165',
+              '166','167','168','169','170','171','172','174','175','176','177','178','179',
+              '180','181','182','183','184','185','186','187','188','189','190','191','192',
+              '193','194','195'
+          ) THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN (
+              'C00','C01','C02','C03','C04','C05','C06','C07','C08','C09','C10','C11','C12',
+              'C13','C14','C15','C16','C17','C18','C19','C20','C21','C22','C23','C24','C25',
+              'C26','C30','C31','C32','C33','C34','C37','C38','C39','C40','C41','C43','C45',
+              'C46','C47','C48','C49','C50','C51','C52','C53','C54','C55','C56','C57','C58',
+              'C60','C61','C62','C63','C64','C65','C66','C67','C68','C69','C70','C71','C72',
+              'C73','C74','C75','C76','C97'
+          ) THEN 1
+          ELSE 0
+      END AS TUMOR,
+      
+      -- 21. ARTH: Rheumatoid arthritis/collagen vascular diseases
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('72889','72930') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('7010','7100','7101','7102','7103','7104','7108','7109','7112','7193','7285') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('446','714','720','725') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('L940','L941','L943','M120','M123','M310','M311','M312','M313','M461','M468','M469') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('M05','M06','M08','M30','M32','M33','M34','M35','M45') THEN 1
+          ELSE 0
+      END AS ARTH,
+      
+      -- 22. COAG: Coagulation deficiency
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2871','2873','2874','2875') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('286') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('D691','D693','D694','D695','D696') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('D65','D66','D67','D68') THEN 1
+          ELSE 0
+      END AS COAG,
+      
+      -- 23. OBESE: Obesity
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2780') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('E66') THEN 1
+          ELSE 0
+      END AS OBESE,
+      
+      -- 24. WGHTLOSS: Weight loss
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('7832','7994') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('260','261','262','263') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('R634') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('E40','E41','E42','E43','E44','E45','E46','R64') THEN 1
+          ELSE 0
+      END AS WGHTLOSS,
+      
+      -- 25. LYTES: Fluid and electrolyte disorders
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2536') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('276') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('E222') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('E86','E87') THEN 1
+          ELSE 0
+      END AS LYTES,
+      
+      -- 26. BLDLOSS: Blood loss anemia
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2800') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('D500') THEN 1
+          ELSE 0
+      END AS BLDLOSS,
+      
+      -- 27. ANEMDEF: Deficiency anemias
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2801','2802','2803','2804','2805','2806','2807','2808','2809') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('281') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('D508','D509') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('D51','D52','D53') THEN 1
+          ELSE 0
+      END AS ANEMDEF,
+      
+      -- 28. ALCOHOL: Alcohol abuse
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN (
+              '2652','2911','2912','2913','2915','2916','2917','2918','2919','3030','3039',
+              '3050','3575','4255','5353','5710','5711','5712','5713','V113'
+          ) THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('980') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('G621','I426','K292','K700','K703','K709','Z502','Z714','Z721') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('F10','E52','T51') THEN 1
+          ELSE 0
+      END AS ALCOHOL,
+      
+      -- 29. DRUG: Drug abuse
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('V6542') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('3052','3053','3054','3055','3056','3057','3058','3059') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('292','304') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('Z715','Z722') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('F11','F12','F13','F14','F15','F16','F18','F19') THEN 1
+          ELSE 0
+      END AS DRUG,
+      
+      -- 30. PSYCH: Psychoses
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 5) IN ('29604','29614','29644','29654') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2938') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('295','297','298') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('F302','F312','F315') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('F20','F22','F23','F24','F25','F28','F29') THEN 1
+          ELSE 0
+      END AS PSYCH,
+      
+      -- 31. DEPRESS: Depression
+      CASE
+          WHEN SUBSTR(icd9_code, 1, 4) IN ('2962','2963','2965','3004') THEN 1
+          WHEN SUBSTR(icd9_code, 1, 3) IN ('309','311') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 4) IN ('F204','F313','F314','F315','F341','F412','F432') THEN 1
+          WHEN SUBSTR(icd10_code, 1, 3) IN ('F32','F33') THEN 1
+          ELSE 0
+      END AS DEPRESS
+      
+  FROM temp_icd
+")
+
+cat("✓ Created flags for 31 types of Elixhauser comorbidities\n")
+```
+
+
+
+```{r step22-3-aggregate-by-hadm}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.3: Aggregation at hadm_id Level\n")
+cat(strrep("=", 60), "\n")
+
+# Aggregate comorbidities by MAX for each admission (hadm_id)
+# If any code for that comorbidity exists, set to 1
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_eligrp AS
+  SELECT 
+      hadm_id,
+      MAX(CHF) AS chf,
+      MAX(ARRHY) AS arrhy,
+      MAX(VALVE) AS valve,
+      MAX(PULMCIRC) AS pulmcirc,
+      MAX(PERIVASC) AS perivasc,
+      MAX(HTN) AS htn,
+      MAX(HTNCX) AS htncx,
+      MAX(PARA) AS para,
+      MAX(NEURO) AS neuro,
+      MAX(CHRNLUNG) AS chrnlung,
+      MAX(DM) AS dm,
+      MAX(DMCX) AS dmcx,
+      MAX(HYPOTHY) AS hypothy,
+      MAX(RENLFAIL) AS renlfail,
+      MAX(LIVER) AS liver,
+      MAX(ULCER) AS ulcer,
+      MAX(AIDS) AS aids,
+      MAX(LYMPH) AS lymph,
+      MAX(METS) AS mets,
+      MAX(TUMOR) AS tumor,
+      MAX(ARTH) AS arth,
+      MAX(COAG) AS coag,
+      MAX(OBESE) AS obese,
+      MAX(WGHTLOSS) AS wghtloss,
+      MAX(LYTES) AS lytes,
+      MAX(BLDLOSS) AS bldloss,
+      MAX(ANEMDEF) AS anemdef,
+      MAX(ALCOHOL) AS alcohol,
+      MAX(DRUG) AS drug,
+      MAX(PSYCH) AS psych,
+      MAX(DEPRESS) AS depress
+  FROM temp_eliflg
+  GROUP BY hadm_id
+")
+
+cat("✓ Aggregated at hadm_id level\n")
+
+```
+
+
+
+```{r step22-4-final-elixhauser}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.4: Creation of Final Elixhauser Table\n")
+cat(strrep("=", 60), "\n")
+
+# Create final Elixhauser comorbidity table
+# - Merge HTN and HTNCX into HYPERTENSION
+# - Exclusive handling of DM and DMCX
+# - Exclusive handling of TUMOR and METS
+# - Calculate 3 types of scores
+dbExecute(con, "
+  CREATE OR REPLACE TABLE elixhauser_comorbidities AS
+  WITH elx AS (
+      SELECT 
+          e.hadm_id,
+          chf AS CONGESTIVE_HEART_FAILURE,
+          arrhy AS CARDIAC_ARRHYTHMIAS,
+          valve AS VALVULAR_DISEASE,
+          pulmcirc AS PULMONARY_CIRCULATION,
+          perivasc AS PERIPHERAL_VASCULAR,
+          -- Merge HTN and HTNCX
+          CASE
+              WHEN htn = 1 THEN 1
+              WHEN htncx = 1 THEN 1
+              ELSE 0
+          END AS HYPERTENSION,
+          para AS PARALYSIS,
+          neuro AS OTHER_NEUROLOGICAL,
+          chrnlung AS CHRONIC_PULMONARY,
+          -- If complicated diabetes exists, uncomplicated diabetes is 0
+          CASE
+              WHEN dmcx = 1 THEN 0
+              WHEN dm = 1 THEN 1
+              ELSE 0
+          END AS DIABETES_UNCOMPLICATED,
+          dmcx AS DIABETES_COMPLICATED,
+          hypothy AS HYPOTHYROIDISM,
+          renlfail AS RENAL_FAILURE,
+          liver AS LIVER_DISEASE,
+          ulcer AS PEPTIC_ULCER,
+          aids AS AIDS,
+          lymph AS LYMPHOMA,
+          mets AS METASTATIC_CANCER,
+          -- If metastatic cancer exists, solid tumor is 0
+          CASE
+              WHEN mets = 1 THEN 0
+              WHEN tumor = 1 THEN 1
+              ELSE 0
+          END AS SOLID_TUMOR,
+          arth AS RHEUMATOID_ARTHRITIS,
+          coag AS COAGULOPATHY,
+          obese AS OBESITY,
+          wghtloss AS WEIGHT_LOSS,
+          lytes AS FLUID_ELECTROLYTE,
+          bldloss AS BLOOD_LOSS_ANEMIA,
+          anemdef AS DEFICIENCY_ANEMIAS,
+          alcohol AS ALCOHOL_ABUSE,
+          drug AS DRUG_ABUSE,
+          psych AS PSYCHOSES,
+          depress AS DEPRESSION
+      FROM temp_eligrp e
+  )
+  SELECT
+      elx.*,
+
+      -- van Walraven score
+      (
+          0 * AIDS +
+          0 * ALCOHOL_ABUSE +
+         -2 * BLOOD_LOSS_ANEMIA +
+          7 * CONGESTIVE_HEART_FAILURE +
+          3 * CHRONIC_PULMONARY +
+          3 * COAGULOPATHY +
+         -2 * DEFICIENCY_ANEMIAS +
+         -3 * DEPRESSION +
+          0 * DIABETES_COMPLICATED +
+          0 * DIABETES_UNCOMPLICATED +
+         -7 * DRUG_ABUSE +
+          5 * FLUID_ELECTROLYTE +
+          0 * HYPERTENSION +
+          0 * HYPOTHYROIDISM +
+         11 * LIVER_DISEASE +
+          9 * LYMPHOMA +
+         12 * METASTATIC_CANCER +
+          6 * OTHER_NEUROLOGICAL +
+         -4 * OBESITY +
+          7 * PARALYSIS +
+          2 * PERIPHERAL_VASCULAR +
+          0 * PEPTIC_ULCER +
+          0 * PSYCHOSES +
+          4 * PULMONARY_CIRCULATION +
+          0 * RHEUMATOID_ARTHRITIS +
+          5 * RENAL_FAILURE +
+          4 * SOLID_TUMOR +
+         -1 * VALVULAR_DISEASE +
+          6 * WEIGHT_LOSS
+      ) AS elixhauser_vanwalraven,
+
+      -- SID29 score
+      (
+          0 * AIDS +
+         -2 * ALCOHOL_ABUSE +
+         -2 * BLOOD_LOSS_ANEMIA +
+          9 * CONGESTIVE_HEART_FAILURE +
+          3 * CHRONIC_PULMONARY +
+          9 * COAGULOPATHY +
+          0 * DEFICIENCY_ANEMIAS +
+         -4 * DEPRESSION +
+          0 * DIABETES_COMPLICATED +
+         -1 * DIABETES_UNCOMPLICATED +
+         -8 * DRUG_ABUSE +
+          9 * FLUID_ELECTROLYTE +
+         -1 * HYPERTENSION +
+          0 * HYPOTHYROIDISM +
+          5 * LIVER_DISEASE +
+          6 * LYMPHOMA +
+         13 * METASTATIC_CANCER +
+          4 * OTHER_NEUROLOGICAL +
+         -4 * OBESITY +
+          3 * PARALYSIS +
+          0 * PEPTIC_ULCER +
+          4 * PERIPHERAL_VASCULAR +
+         -4 * PSYCHOSES +
+          5 * PULMONARY_CIRCULATION +
+          6 * RENAL_FAILURE +
+          0 * RHEUMATOID_ARTHRITIS +
+          8 * SOLID_TUMOR +
+          0 * VALVULAR_DISEASE +
+          8 * WEIGHT_LOSS
+      ) AS elixhauser_SID29,
+
+      -- SID30 score
+      (
+          0 * AIDS +
+          0 * ALCOHOL_ABUSE +
+         -3 * BLOOD_LOSS_ANEMIA +
+          8 * CARDIAC_ARRHYTHMIAS +
+          9 * CONGESTIVE_HEART_FAILURE +
+          3 * CHRONIC_PULMONARY +
+         12 * COAGULOPATHY +
+          0 * DEFICIENCY_ANEMIAS +
+         -5 * DEPRESSION +
+          1 * DIABETES_COMPLICATED +
+          0 * DIABETES_UNCOMPLICATED +
+        -11 * DRUG_ABUSE +
+         11 * FLUID_ELECTROLYTE +
+         -2 * HYPERTENSION +
+          0 * HYPOTHYROIDISM +
+          7 * LIVER_DISEASE +
+          8 * LYMPHOMA +
+         17 * METASTATIC_CANCER +
+          5 * OTHER_NEUROLOGICAL +
+         -5 * OBESITY +
+          4 * PARALYSIS +
+          0 * PEPTIC_ULCER +
+          4 * PERIPHERAL_VASCULAR +
+         -6 * PSYCHOSES +
+          5 * PULMONARY_CIRCULATION +
+          7 * RENAL_FAILURE +
+          0 * RHEUMATOID_ARTHRITIS +
+         10 * SOLID_TUMOR +
+          0 * VALVULAR_DISEASE +
+         10 * WEIGHT_LOSS
+      ) AS elixhauser_SID30
+      
+  FROM elx
+")
+
+cat("✓ Created final Elixhauser table\n")
+cat("  - 31 binary variables\n")
+cat("  - 3 types of scores (vanwalraven, SID29, SID30)\n")
+```
+
+
+```{r step22-5-join-with-cohort}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.5: Join with HFNC Cohort\n")
+cat(strrep("=", 60), "\n")
+
+# Join with hfnc_cohort_final to create stay_id level table
+dbExecute(con, "
+  CREATE OR REPLACE TABLE static_elixhauser AS
+  SELECT 
+      h.stay_id,
+      h.subject_id,
+      h.hadm_id,
+      e.CONGESTIVE_HEART_FAILURE,
+      e.CARDIAC_ARRHYTHMIAS,
+      e.VALVULAR_DISEASE,
+      e.PULMONARY_CIRCULATION,
+      e.PERIPHERAL_VASCULAR,
+      e.HYPERTENSION,
+      e.PARALYSIS,
+      e.OTHER_NEUROLOGICAL,
+      e.CHRONIC_PULMONARY,
+      e.DIABETES_UNCOMPLICATED,
+      e.DIABETES_COMPLICATED,
+      e.HYPOTHYROIDISM,
+      e.RENAL_FAILURE,
+      e.LIVER_DISEASE,
+      e.PEPTIC_ULCER,
+      e.AIDS,
+      e.LYMPHOMA,
+      e.METASTATIC_CANCER,
+      e.SOLID_TUMOR,
+      e.RHEUMATOID_ARTHRITIS,
+      e.COAGULOPATHY,
+      e.OBESITY,
+      e.WEIGHT_LOSS,
+      e.FLUID_ELECTROLYTE,
+      e.BLOOD_LOSS_ANEMIA,
+      e.DEFICIENCY_ANEMIAS,
+      e.ALCOHOL_ABUSE,
+      e.DRUG_ABUSE,
+      e.PSYCHOSES,
+      e.DEPRESSION,
+      e.elixhauser_vanwalraven,
+      e.elixhauser_SID29,
+      e.elixhauser_SID30
+  FROM hfnc_cohort_final h
+  LEFT JOIN elixhauser_comorbidities e
+      ON h.hadm_id = e.hadm_id
+  ORDER BY h.stay_id
+")
+
+cat("✓ Joined with HFNC cohort\n")
+
+# Replace NULL values with 0 (no comorbidity if no diagnosis)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE static_elixhauser AS
+  SELECT 
+      stay_id,
+      subject_id,
+      hadm_id,
+      COALESCE(CONGESTIVE_HEART_FAILURE, 0) AS CONGESTIVE_HEART_FAILURE,
+      COALESCE(CARDIAC_ARRHYTHMIAS, 0) AS CARDIAC_ARRHYTHMIAS,
+      COALESCE(VALVULAR_DISEASE, 0) AS VALVULAR_DISEASE,
+      COALESCE(PULMONARY_CIRCULATION, 0) AS PULMONARY_CIRCULATION,
+      COALESCE(PERIPHERAL_VASCULAR, 0) AS PERIPHERAL_VASCULAR,
+      COALESCE(HYPERTENSION, 0) AS HYPERTENSION,
+      COALESCE(PARALYSIS, 0) AS PARALYSIS,
+      COALESCE(OTHER_NEUROLOGICAL, 0) AS OTHER_NEUROLOGICAL,
+      COALESCE(CHRONIC_PULMONARY, 0) AS CHRONIC_PULMONARY,
+      COALESCE(DIABETES_UNCOMPLICATED, 0) AS DIABETES_UNCOMPLICATED,
+      COALESCE(DIABETES_COMPLICATED, 0) AS DIABETES_COMPLICATED,
+      COALESCE(HYPOTHYROIDISM, 0) AS HYPOTHYROIDISM,
+      COALESCE(RENAL_FAILURE, 0) AS RENAL_FAILURE,
+      COALESCE(LIVER_DISEASE, 0) AS LIVER_DISEASE,
+      COALESCE(PEPTIC_ULCER, 0) AS PEPTIC_ULCER,
+      COALESCE(AIDS, 0) AS AIDS,
+      COALESCE(LYMPHOMA, 0) AS LYMPHOMA,
+      COALESCE(METASTATIC_CANCER, 0) AS METASTATIC_CANCER,
+      COALESCE(SOLID_TUMOR, 0) AS SOLID_TUMOR,
+      COALESCE(RHEUMATOID_ARTHRITIS, 0) AS RHEUMATOID_ARTHRITIS,
+      COALESCE(COAGULOPATHY, 0) AS COAGULOPATHY,
+      COALESCE(OBESITY, 0) AS OBESITY,
+      COALESCE(WEIGHT_LOSS, 0) AS WEIGHT_LOSS,
+      COALESCE(FLUID_ELECTROLYTE, 0) AS FLUID_ELECTROLYTE,
+      COALESCE(BLOOD_LOSS_ANEMIA, 0) AS BLOOD_LOSS_ANEMIA,
+      COALESCE(DEFICIENCY_ANEMIAS, 0) AS DEFICIENCY_ANEMIAS,
+      COALESCE(ALCOHOL_ABUSE, 0) AS ALCOHOL_ABUSE,
+      COALESCE(DRUG_ABUSE, 0) AS DRUG_ABUSE,
+      COALESCE(PSYCHOSES, 0) AS PSYCHOSES,
+      COALESCE(DEPRESSION, 0) AS DEPRESSION,
+      COALESCE(elixhauser_vanwalraven, 0) AS elixhauser_vanwalraven,
+      COALESCE(elixhauser_SID29, 0) AS elixhauser_SID29,
+      COALESCE(elixhauser_SID30, 0) AS elixhauser_SID30
+  FROM static_elixhauser
+")
+
+cat("✓ Replaced NULL values with 0\n")
+```
+
+
+```{r step22-7-cleanup}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 22.7: Cleanup of Temporary Tables\n")
+cat(strrep("=", 60), "\n")
+
+# Drop temporary tables
+dbExecute(con, "DROP TABLE IF EXISTS temp_icd")
+dbExecute(con, "DROP TABLE IF EXISTS temp_eliflg")
+dbExecute(con, "DROP TABLE IF EXISTS temp_eligrp")
+dbExecute(con, "DROP TABLE IF EXISTS elixhauser_comorbidities")
+
+cat("✓ Deleted temporary tables\n")
+```
+
+## Step 23: Extraction of Other Static Variables
+
+### Purpose
+Extract static variables including patient basic information, hospital admission information, and ICU information.
+
+### Data Sources
+- `hosp_patients`: Patient basic information (gender, age, etc.)
+- `hosp_admissions`: Hospital admission information (insurance, race, admission/discharge dates, etc.)
+- `icu_icustays`: ICU information (care unit, length of stay, etc.)
+- `hfnc_cohort_final`: HFNC cohort
+
+### Variables to Extract
+**Patient Information (4 variables):**
+- gender: Gender
+- anchor_age: Age
+- anchor_year: Anchor year
+- anchor_year_group: Age group
+
+**Admission Information (9 variables):**
+- insurance: Insurance type
+- language: Language
+- marital_status: Marital status
+- race: Race
+- admission_type: Admission type
+- admission_location: Admission source
+- discharge_location: Discharge destination
+- admittime, dischtime: Admission/discharge times
+
+**ICU Information (5 variables):**
+- first_careunit, last_careunit: First/last care unit
+- intime, outtime: ICU in/out times
+- los: ICU length of stay (days)
+
+
+
+```{r step23-1-extract-static-variables}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 23.1: Extraction of Static Variables\n")
+cat(strrep("=", 60), "\n")
+
+# Using logic from 12_static_variables.sql
+# Extract limited to HFNC cohort
+dbExecute(con, "
+  CREATE OR REPLACE TABLE static_variables AS
+  SELECT
+      -- Identifiers
+      p.subject_id,
+      a.hadm_id,
+      i.stay_id,
+
+      -- Patient information
+      p.gender,
+      p.anchor_age,
+      p.anchor_year,
+      p.anchor_year_group,
+
+      -- Admission information
+      a.insurance,
+      a.language,
+      a.marital_status,
+      a.race,
+      a.admission_type,
+      a.admission_location,
+      a.discharge_location,
+      a.admittime,
+      a.dischtime,
+      a.deathtime,
+
+      -- ICU information
+      i.first_careunit,
+      i.last_careunit,
+      i.intime,
+      i.outtime,
+      i.los
+
+  FROM hfnc_cohort_final h
+  INNER JOIN hosp_patients p
+      ON h.subject_id = p.subject_id
+  INNER JOIN hosp_admissions a
+      ON h.hadm_id = a.hadm_id
+  INNER JOIN icu_icustays i
+      ON h.stay_id = i.stay_id
+  ORDER BY h.stay_id
+")
+
+cat("✓ Extracted static variables\n")
+
+
+```
+
+## Step 24: Join All Data Tables
+
+### Purpose
+Integrate static variables (Elixhauser comorbidities + basic information) and time-series data (person_hourly_with_gcs) to create the final analytical dataset.
+
+### Tables to Integrate
+1. **static_elixhauser** (Step 22): 31 comorbidities + 3 scores
+2. **static_variables** (Step 23): Patient, admission, and ICU information
+3. **person_hourly_with_gcs** (File 02): Time-series data (hourly)
+
+### Join Key
+- stay_id (common across all tables)
+
+
+### 24.1 Check Prerequisites
+```{r step24-1-check-prerequisites}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 24.1: Check Prerequisites\n")
+cat(strrep("=", 60), "\n")
+
+# Check if required tables exist
+required_tables <- c(
+  "static_elixhauser",
+  "static_variables",
+  "person_hourly_with_gcs"
+)
+
+existing_tables <- dbListTables(con)
+missing_tables <- setdiff(required_tables, existing_tables)
+
+if (length(missing_tables) > 0) {
+  stop("❌ Required tables not found: ", paste(missing_tables, collapse = ", "))
+}
+
+cat("✓ All required tables exist\n\n")
+
+# Check row count and structure of each table
+for (tbl in required_tables) {
+  row_count <- dbGetQuery(con, sprintf("SELECT COUNT(*) as n FROM %s", tbl))
+
+  if (tbl == "person_hourly_with_gcs") {
+    # For time-series data, check stay_id count and hour range
+    detail <- dbGetQuery(con, sprintf("
+      SELECT
+        COUNT(DISTINCT stay_id) as n_patients,
+        MIN(hr) as min_hr,
+        MAX(hr) as max_hr
+      FROM %s
+    ", tbl))
+
+    cat(sprintf("【%s】\n", tbl))
+    cat(sprintf("  Total observations: %s\n", format(row_count$n, big.mark = ",")))
+    cat(sprintf("  Number of patients: %s\n", format(detail$n_patients, big.mark = ",")))
+    cat(sprintf("  hr range: %d ~ %d\n\n", detail$min_hr, detail$max_hr))
+  } else {
+    # For static data, only check stay_id count
+    cat(sprintf("【%s】\n", tbl))
+    cat(sprintf("  Number of patients: %s\n\n", format(row_count$n, big.mark = ",")))
+  }
+}
+```
+
+
+### 24.2 Merge Static Data
+```{r step24-2-merge-static-data}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 24.2: Merge Static Data\n")
+cat(strrep("=", 60), "\n")
+
+# static_elixhauser + static_variables
+# Join by stay_id
+dbExecute(con, "
+  CREATE OR REPLACE TABLE static_data_combined AS
+  SELECT
+      e.stay_id,
+      e.subject_id,
+      e.hadm_id,
+
+      -- From static_variables
+      v.gender,
+      v.anchor_age,
+      v.anchor_year,
+      v.anchor_year_group,
+      v.insurance,
+      v.language,
+      v.marital_status,
+      v.race,
+      v.admission_type,
+      v.admission_location,
+      v.discharge_location,
+      v.admittime,
+      v.dischtime,
+      v.deathtime,
+      v.first_careunit,
+      v.last_careunit,
+      v.intime,
+      v.outtime,
+      v.los,
+
+      -- From static_elixhauser (31 comorbidities)
+      e.CONGESTIVE_HEART_FAILURE,
+      e.CARDIAC_ARRHYTHMIAS,
+      e.VALVULAR_DISEASE,
+      e.PULMONARY_CIRCULATION,
+      e.PERIPHERAL_VASCULAR,
+      e.HYPERTENSION,
+      e.PARALYSIS,
+      e.OTHER_NEUROLOGICAL,
+      e.CHRONIC_PULMONARY,
+      e.DIABETES_UNCOMPLICATED,
+      e.DIABETES_COMPLICATED,
+      e.HYPOTHYROIDISM,
+      e.RENAL_FAILURE,
+      e.LIVER_DISEASE,
+      e.PEPTIC_ULCER,
+      e.AIDS,
+      e.LYMPHOMA,
+      e.METASTATIC_CANCER,
+      e.SOLID_TUMOR,
+      e.RHEUMATOID_ARTHRITIS,
+      e.COAGULOPATHY,
+      e.OBESITY,
+      e.WEIGHT_LOSS,
+      e.FLUID_ELECTROLYTE,
+      e.BLOOD_LOSS_ANEMIA,
+      e.DEFICIENCY_ANEMIAS,
+      e.ALCOHOL_ABUSE,
+      e.DRUG_ABUSE,
+      e.PSYCHOSES,
+      e.DEPRESSION,
+
+      -- Elixhauser scores (3 types)
+      e.elixhauser_vanwalraven,
+      e.elixhauser_SID29,
+      e.elixhauser_SID30
+
+  FROM static_elixhauser e
+  INNER JOIN static_variables v
+      ON e.stay_id = v.stay_id
+  ORDER BY e.stay_id
+")
+
+cat("✓ Merged static data\n")
+
+# Check merge results
+static_check <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_patients,
+      COUNT(DISTINCT subject_id) as unique_subjects,
+      COUNT(DISTINCT hadm_id) as unique_admissions
+  FROM static_data_combined
+")
+
+print("After static data merge:")
+print(static_check)
+```
+
+
+### 24.3 Merge with Time-Series Data
+```{r step24-3-merge-with-timeseries}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 24.3: Merge with Time-Series Data (Revised - All Variables Retained)\n")
+cat(strrep("=", 60), "\n")
+
+# static_data_combined + person_hourly_with_gcs + derive_sofa + derive_sepsis3
+# Join by stay_id (static data repeated for each time-series row)
+# Retain all variables from person_hourly_with_gcs
+dbExecute(con, "
+  CREATE OR REPLACE TABLE final_dataset AS
+  SELECT
+      -- Time-series identifiers
+      t.stay_id,
+      t.hr,
+      t.time,
+
+      -- Static variables: Basic IDs
+      s.subject_id,
+      s.hadm_id,
+
+      -- Basic information from person_hourly_with_gcs (taken from t to avoid duplication)
+      t.intime,
+      t.outtime,
+      t.anchor_age,
+      t.first_hfnc_start,
+      t.hr_at_hfnc_start,
+      t.original_hfnc_start,
+      t.original_hr_at_hfnc_start,
+
+      -- Code status from person_hourly_with_gcs
+      t.fullcode,
+      t.dni,
+      t.dnr,
+      t.dnr_dni,
+      t.cmo,
+
+      -- Death and discharge variables from person_hourly_with_gcs (Important!)
+      t.deathtime_inhosp,
+      t.dod,
+      t.death_datetime,
+      t.death_location,
+      t.time_to_death,
+      t.death_30day,
+      t.hr_at_death,
+      t.hr_at_icu_discharge,
+      t.hr_at_hosp_discharge,
+      t.death_event,
+      t.icu_discharge_event,
+      t.hosp_discharge_event,
+
+      -- Static variables: Patient basic information (from s)
+      s.gender,
+      s.anchor_year,
+      s.anchor_year_group,
+
+      -- Static variables: Admission information
+      s.insurance,
+      s.language,
+      s.marital_status,
+      s.race,
+      s.admission_type,
+      s.admission_location,
+      s.discharge_location,
+      s.admittime,
+      s.dischtime,
+      s.deathtime,
+
+      -- Static variables: ICU information
+      s.first_careunit,
+      s.last_careunit,
+      s.los,
+
+      -- Static variables: Elixhauser comorbidities (31 items)
+      s.CONGESTIVE_HEART_FAILURE,
+      s.CARDIAC_ARRHYTHMIAS,
+      s.VALVULAR_DISEASE,
+      s.PULMONARY_CIRCULATION,
+      s.PERIPHERAL_VASCULAR,
+      s.HYPERTENSION,
+      s.PARALYSIS,
+      s.OTHER_NEUROLOGICAL,
+      s.CHRONIC_PULMONARY,
+      s.DIABETES_UNCOMPLICATED,
+      s.DIABETES_COMPLICATED,
+      s.HYPOTHYROIDISM,
+      s.RENAL_FAILURE,
+      s.LIVER_DISEASE,
+      s.PEPTIC_ULCER,
+      s.AIDS,
+      s.LYMPHOMA,
+      s.METASTATIC_CANCER,
+      s.SOLID_TUMOR,
+      s.RHEUMATOID_ARTHRITIS,
+      s.COAGULOPATHY,
+      s.OBESITY,
+      s.WEIGHT_LOSS,
+      s.FLUID_ELECTROLYTE,
+      s.BLOOD_LOSS_ANEMIA,
+      s.DEFICIENCY_ANEMIAS,
+      s.ALCOHOL_ABUSE,
+      s.DRUG_ABUSE,
+      s.PSYCHOSES,
+      s.DEPRESSION,
+      s.elixhauser_vanwalraven,
+      s.elixhauser_SID29,
+      s.elixhauser_SID30,
+
+      -- Time-series variables: Outcome (19_mv_trial.sql format)
+      CASE
+          WHEN t.icu_discharge_event = 1 OR t.hosp_discharge_event = 1
+          THEN 1
+          ELSE 0
+      END AS discharge_outcome,
+
+      -- Time-series variables: Ventilator (COALESCE NULL to 0)
+      COALESCE(t.invasive, 0) AS invasive,
+      COALESCE(t.noninvasive, 0) AS noninvasive,
+      COALESCE(t.highflow, 0) AS highflow,
+
+      -- Time-series variables: Vital signs
+      t.heart_rate,
+      t.sbp,
+      t.dbp,
+      t.mbp,
+      t.sbp_ni,
+      t.dbp_ni,
+      t.mbp_ni,
+      t.resp_rate,
+      t.temperature,
+      t.spo2,
+      t.glucose,
+      t.gcs,
+
+
+      -- Time-series variables: Ventilator settings
+      -- FiO2 only valid during ventilator use (19_mv_trial.sql format)
+      CASE
+          WHEN COALESCE(t.invasive, 0) = 1
+            OR COALESCE(t.noninvasive, 0) = 1
+            OR COALESCE(t.highflow, 0) = 1
+          THEN t.fio2
+          ELSE NULL
+      END AS fio2,
+      t.o2_flow,
+      t.o2_flow_additional,
+      t.o2_flow_total,
+
+      -- Time-series variables: Vasopressors
+      t.norepinephrine,
+      t.epinephrine,
+      t.dopamine,
+      t.phenylephrine,
+      t.dobutamine,
+      t.vasopressor,
+
+      -- Time-series variables: Blood gas
+      t.ph,
+      t.po2,
+      t.pco2,
+      t.lactate,
+      t.pao2fio2ratio,
+      t.baseexcess,
+      t.bicarbonate,
+
+      -- Time-series variables: Chemistry
+      t.creatinine,
+      t.sodium,
+      t.potassium,
+      t.chloride,
+      t.bun,
+      t.glucose_chem,
+
+      -- Time-series variables: Complete blood count
+      t.wbc,
+      t.hemoglobin,
+      t.hematocrit,
+      t.platelet,
+
+      -- Time-series variables: CRRT (corrected to rrt, COALESCE NULL to 0)
+      COALESCE(t.rrt, 0) AS crrt,
+
+      -- Time-series variables: SOFA (joined from derive_sofa)
+      sofa.bilirubin_max,
+      sofa.respiration,
+      sofa.coagulation,
+      sofa.liver,
+      sofa.cardiovascular,
+      sofa.cns,
+      sofa.renal,
+      sofa.sofa_24hours,
+      sofa.respiration_24hours,
+      sofa.coagulation_24hours,
+      sofa.liver_24hours,
+      sofa.cardiovascular_24hours,
+      sofa.cns_24hours,
+      sofa.renal_24hours,
+
+      -- Time-series variables: Sepsis3 (joined from derive_sepsis3, patient-level information)
+      CASE
+          WHEN sep.sepsis3 = TRUE THEN 1
+          ELSE 0
+      END AS sepsis3
+
+  FROM person_hourly_with_gcs t
+  INNER JOIN static_data_combined s
+      ON t.stay_id = s.stay_id
+  LEFT JOIN derive_sofa sofa
+      ON t.stay_id = sofa.stay_id
+      AND t.hr = sofa.hr
+  LEFT JOIN derive_sepsis3 sep
+      ON t.stay_id = sep.stay_id
+  ORDER BY t.stay_id, t.hr
+")
+
+cat("✓ Merged time-series and static data\n")
+cat("✓ Modifications:\n")
+cat("  - Retained all variables from person_hourly_with_gcs\n")
+cat("  - Added death and discharge variables (12 variables):\n")
+cat("    - deathtime_inhosp, dod, death_datetime, death_location\n")
+cat("    - time_to_death, death_30day, hr_at_death\n")
+cat("    - hr_at_icu_discharge, hr_at_hosp_discharge\n")
+cat("    - death_event, icu_discharge_event, hosp_discharge_event\n")
+cat("  - Added HFNC-related variables (4 variables):\n")
+cat("    - first_hfnc_start, hr_at_hfnc_start\n")
+cat("    - original_hfnc_start, original_hr_at_hfnc_start\n")
+cat("  - Added blood gas variables: baseexcess, bicarbonate\n")
+cat("  - Added chemistry variable: glucose_chem\n")
+cat("  - CRRT: corrected t.crrt → t.rrt\n")
+cat("  - Joined SOFA scores from derive_sofa\n")
+cat("  - Joined Sepsis3 from derive_sepsis3\n")
+cat("  - Added discharge_outcome (ICU discharge or hospital discharge)\n")
+cat("  - Applied COALESCE to binary variables\n")
+cat("  - Conditional processing of FiO2 (only valid during ventilator use)\n")
+
+
+```
+
+### 24.4 Data Structure
+
+```{r step24-4-data-structure}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 24.4: Data Structure Check (Revised)\n")
+cat(strrep("=", 60), "\n")
+
+# Check column count
+column_info <- dbGetQuery(con, "DESCRIBE final_dataset")
+
+cat("Total number of columns:", nrow(column_info), "\n\n")
+
+# Classify columns by category (updated version)
+cat("【Column Classification】\n")
+cat("1. Identifiers and Time Axis (3 variables):\n")
+cat("   stay_id, hr, time\n\n")
+
+cat("2. Static: Basic IDs (2 variables):\n")
+cat("   subject_id, hadm_id\n\n")
+
+cat("3. Static: Patient Basic Information (4 variables):\n")
+cat("   gender, anchor_age, anchor_year, anchor_year_group\n\n")
+
+cat("4. Static: Admission Information (10 variables):\n")
+cat("   insurance, language, marital_status, race\n")
+cat("   admission_type, admission_location, discharge_location\n")
+cat("   admittime, dischtime, deathtime\n\n")
+
+cat("5. Static: ICU Information (5 variables):\n")
+cat("   first_careunit, last_careunit, intime, outtime, los\n\n")
+
+cat("6. Static: Elixhauser Comorbidities (31 variables):\n")
+cat("   CONGESTIVE_HEART_FAILURE, CARDIAC_ARRHYTHMIAS, ...\n\n")
+
+cat("7. Static: Elixhauser Scores (3 variables):\n")
+cat("   elixhauser_vanwalraven, elixhauser_SID29, elixhauser_SID30\n\n")
+
+cat("8. Time-series: HFNC-Related Information (4 variables):\n")
+cat("   first_hfnc_start, hr_at_hfnc_start\n")
+cat("   original_hfnc_start, original_hr_at_hfnc_start\n\n")
+
+cat("9. Time-series: Death and Discharge Events (12 variables):\n")
+cat("   deathtime_inhosp, dod, death_datetime, death_location\n")
+cat("   time_to_death, death_30day, hr_at_death\n")
+cat("   hr_at_icu_discharge, hr_at_hosp_discharge\n")
+cat("   death_event, icu_discharge_event, hosp_discharge_event\n\n")
+
+cat("10. Time-series: Outcome (1 variable):\n")
+cat("   discharge_outcome\n\n")
+
+cat("11. Time-series: Ventilator (3 variables):\n")
+cat("   invasive, noninvasive, highflow\n\n")
+
+cat("12. Time-series: Vital Signs (11 variables):\n")
+cat("   heart_rate, sbp, dbp, mbp, sbp_ni, dbp_ni, mbp_ni\n")
+cat("   resp_rate, temperature, spo2, glucose\n\n")
+
+cat("13. Time-series: Ventilator Settings (4 variables):\n")
+cat("   fio2, o2_flow, o2_flow_additional, o2_flow_total\n\n")
+
+cat("14. Time-series: Vasopressors (6 variables):\n")
+cat("   norepinephrine, epinephrine, dopamine\n")
+cat("   phenylephrine, dobutamine, vasopressor\n\n")
+
+cat("15. Time-series: Blood Gas (7 variables):\n")
+cat("   ph, po2, pco2, lactate, pao2fio2ratio\n")
+cat("   baseexcess, bicarbonate\n\n")
+
+cat("16. Time-series: Chemistry (6 variables):\n")
+cat("   creatinine, sodium, potassium, chloride, bun, glucose_chem\n\n")
+
+cat("17. Time-series: Complete Blood Count (4 variables):\n")
+cat("   wbc, hemoglobin, hematocrit, platelet\n\n")
+
+cat("18. Time-series: Treatment Intervention (1 variable):\n")
+cat("   crrt\n\n")
+
+cat("19. Time-series: Scores (8 variables):\n")
+cat("   sofa_24hours, respiration_24hours, coagulation_24hours\n")
+cat("   liver_24hours, cardiovascular_24hours, cns_24hours\n")
+cat("   renal_24hours, sepsis3\n\n")
+
+# Distribution of data types
+cat("【Column Data Types】\n")
+type_summary <- table(column_info$column_type)
+print(type_summary)
+
+# Aggregate column counts
+category_counts <- c(
+  "Identifiers and Time Axis" = 3,
+  "Static: Basic IDs" = 2,
+  "Static: Patient Basic Info" = 4,
+  "Static: Admission Info" = 10,
+  "Static: ICU Info" = 5,
+  "Static: Elixhauser Comorbidities" = 31,
+  "Static: Elixhauser Scores" = 3,
+  "Time-series: HFNC-Related" = 4,
+  "Time-series: Death/Discharge" = 12,
+  "Time-series: Outcome" = 1,
+  "Time-series: Ventilator" = 3,
+  "Time-series: Vital Signs" = 11,
+  "Time-series: Ventilator Settings" = 4,
+  "Time-series: Vasopressors" = 6,
+  "Time-series: Blood Gas" = 7,
+  "Time-series: Chemistry" = 6,
+  "Time-series: CBC" = 4,
+  "Time-series: Treatment" = 1,
+  "Time-series: Scores" = 8
+)
+
+cat("\n【Variable Count by Category】\n")
+for (i in seq_along(category_counts)) {
+  cat(sprintf("%-35s: %2d variables\n", names(category_counts)[i], category_counts[i]))
+}
+cat(sprintf("\nTotal: %d variables\n", sum(category_counts)))
+```
+
+
+## Step 25: Data Quality Check
+
+### Purpose
+Verify the quality of the final dataset (final_dataset) and confirm it is suitable for analysis.
+
+### Check Items
+1. **Create complete variable list**: Organize variable names, data types, and categories
+2. **Missing value pattern verification**: Missing rates and patterns for main variables
+3. **Outlier detection**: Check physiological and clinical validity
+4. **Logical consistency check**: Variable relationships and time-series continuity
+
+
+### variable
+```{r step25-1-variable-inventory}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 25.1: Create complete variable list\n")
+cat(strrep("=", 60), "\n")
+
+# Get all column information from final_dataset
+all_columns <- dbGetQuery(con, "DESCRIBE final_dataset")
+
+cat("Total columns:", nrow(all_columns), "\n\n")
+
+# Column name list
+col_names <- all_columns$column_name
+
+# Categorize (updated version)
+variable_categories <- list(
+  "Identifiers & Time" = c("stay_id", "hr", "time"),
+
+  "Static: Basic ID" = c("subject_id", "hadm_id"),
+
+  "Static: Patient Demographics" = c("gender", "anchor_age", "anchor_year", "anchor_year_group"),
+
+  "Static: Admission Info" = c("insurance", "language", "marital_status", "race",
+                        "admission_type", "admission_location", "discharge_location",
+                        "admittime", "dischtime", "deathtime"),
+
+  "Static: ICU Info" = c("first_careunit", "last_careunit", "intime", "outtime", "los"),
+
+  "Static: Elixhauser Comorbidities" = c(
+    "CONGESTIVE_HEART_FAILURE", "CARDIAC_ARRHYTHMIAS", "VALVULAR_DISEASE",
+    "PULMONARY_CIRCULATION", "PERIPHERAL_VASCULAR", "HYPERTENSION",
+    "PARALYSIS", "OTHER_NEUROLOGICAL", "CHRONIC_PULMONARY",
+    "DIABETES_UNCOMPLICATED", "DIABETES_COMPLICATED", "HYPOTHYROIDISM",
+    "RENAL_FAILURE", "LIVER_DISEASE", "PEPTIC_ULCER", "AIDS",
+    "LYMPHOMA", "METASTATIC_CANCER", "SOLID_TUMOR", "RHEUMATOID_ARTHRITIS",
+    "COAGULOPATHY", "OBESITY", "WEIGHT_LOSS", "FLUID_ELECTROLYTE",
+    "BLOOD_LOSS_ANEMIA", "DEFICIENCY_ANEMIAS", "ALCOHOL_ABUSE",
+    "DRUG_ABUSE", "PSYCHOSES", "DEPRESSION"
+  ),
+
+  "Static: Elixhauser Scores" = c("elixhauser_vanwalraven", "elixhauser_SID29", "elixhauser_SID30"),
+
+  "Time-series: HFNC-related" = c("first_hfnc_start", "hr_at_hfnc_start",
+                          "original_hfnc_start", "original_hr_at_hfnc_start"),
+
+  "Time-series: Death/Discharge Events" = c("deathtime_inhosp", "dod", "death_datetime", "death_location",
+                                     "time_to_death", "death_30day", "hr_at_death",
+                                     "hr_at_icu_discharge", "hr_at_hosp_discharge",
+                                     "death_event", "icu_discharge_event", "hosp_discharge_event"),
+
+  "Time-series: Outcome" = c("discharge_outcome"),
+
+  "Time-series: Ventilation" = c("invasive", "noninvasive", "highflow"),
+
+  "Time-series: Vital Signs" = c("heart_rate", "sbp", "dbp", "mbp", "sbp_ni", "dbp_ni",
+                                "mbp_ni", "resp_rate", "temperature", "spo2", "glucose"),
+
+  "Time-series: Ventilator Settings" = c("fio2", "o2_flow", "o2_flow_additional", "o2_flow_total"),
+
+  "Time-series: Vasopressors" = c("norepinephrine", "epinephrine", "dopamine",
+                           "phenylephrine", "dobutamine", "vasopressor"),
+
+  "Time-series: Blood Gas" = c("ph", "po2", "pco2", "lactate", "pao2fio2ratio",
+                          "baseexcess", "bicarbonate"),
+
+  "Time-series: Chemistry" = c("creatinine", "sodium", "potassium", "chloride", "bun", "glucose_chem"),
+
+  "Time-series: CBC" = c("wbc", "hemoglobin", "hematocrit", "platelet"),
+
+  "Time-series: Treatment" = c("crrt"),
+
+  "Time-series: Scores" = c("sofa_24hours", "respiration_24hours", "coagulation_24hours",
+                       "liver_24hours", "cardiovascular_24hours", "cns_24hours",
+                       "renal_24hours", "sepsis3")
+)
+
+# Summarize by category
+cat("[Variable Count by Category]\n")
+for (cat_name in names(variable_categories)) {
+  n_vars <- length(variable_categories[[cat_name]])
+  cat(sprintf("%-40s: %2d variables\n", cat_name, n_vars))
+}
+
+cat("\nTotal:", sum(sapply(variable_categories, length)), "variables\n")
+```
+
+
+### 25.2 detailed variable table
+
+```{r step25-2-detailed-variable-table}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 25.2: Detailed variable list\n")
+cat(strrep("=", 60), "\n")
+
+# Create detailed table with category information
+variable_table <- data.frame(
+  No = integer(),
+  Category = character(),
+  Variable_Name = character(),
+  Data_Type = character(),
+  stringsAsFactors = FALSE
+)
+
+counter <- 1
+for (cat_name in names(variable_categories)) {
+  vars_in_cat <- variable_categories[[cat_name]]
+
+  for (var_name in vars_in_cat) {
+    # Get data type
+    dtype <- all_columns$column_type[all_columns$column_name == var_name]
+
+    if (length(dtype) == 0) {
+      dtype <- "NOT_FOUND"
+    }
+
+    variable_table <- rbind(
+      variable_table,
+      data.frame(
+        No = counter,
+        Category = cat_name,
+        Variable_Name = var_name,
+        Data_Type = dtype,
+        stringsAsFactors = FALSE
+      )
+    )
+    counter <- counter + 1
+  }
+}
+
+# Display all variable list
+cat("[Complete Variable List]\n")
+print(variable_table, row.names = FALSE)
+
+```
+
+
+
+
+
+
+### 25.5 export-variable-list
+
+```{r step25-5-export-variable-list}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 25.5: Export variable list\n")
+cat(strrep("=", 60), "\n")
+
+# Save as CSV
+output_dir <- here("output")
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+csv_path <- file.path(output_dir, "final_dataset_variable_list.csv")
+write.csv(variable_table, csv_path, row.names = FALSE)
+
+cat("✓ Variable list saved:\n")
+cat("  ", csv_path, "\n")
+```
+
+
+## Step 26: Final Dataset Export
+
+### Purpose
+Export the final analysis dataset (final_dataset), create a data dictionary, and complete analysis preparation.
+
+### Export Contents
+1. **Main dataset**: CSV/Parquet format
+2. **Data dictionary**: Detailed variable descriptions
+3. **Basic statistics summary**: Descriptive statistics
+4. **Cohort information**: Patient counts, observation period, etc.
+
+
+### 26.1 prepare export
+```{r step26-1-prepare-export}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 26.1: Prepare export\n")
+cat(strrep("=", 60), "\n")
+
+# Create output directory
+output_dir <- here("output")
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat("✓ Output directory created:", output_dir, "\n")
+} else {
+  cat("✓ Output directory:", output_dir, "\n")
+}
+
+# Basic information about final dataset
+dataset_info <- dbGetQuery(con, "
+  SELECT 
+    COUNT(*) as total_observations,
+    COUNT(DISTINCT stay_id) as unique_patients,
+    COUNT(DISTINCT subject_id) as unique_subjects,
+    COUNT(DISTINCT hadm_id) as unique_admissions,
+    MIN(hr) as min_hr,
+    MAX(hr) as max_hr,
+    ROUND(AVG(hr), 1) as mean_hr
+  FROM final_dataset
+")
+
+cat("\n[Final Dataset Information]\n")
+cat(sprintf("Total observations: %s\n", format(dataset_info$total_observations, big.mark = ",")))
+cat(sprintf("Patients (stay_id): %s\n", format(dataset_info$unique_patients, big.mark = ",")))
+cat(sprintf("Patients (subject_id): %s\n", format(dataset_info$unique_subjects, big.mark = ",")))
+cat(sprintf("Admissions (hadm_id): %s\n", format(dataset_info$unique_admissions, big.mark = ",")))
+cat(sprintf("Time range: hr %d ~ %d (mean: %.1f)\n",
+            dataset_info$min_hr, dataset_info$max_hr, dataset_info$mean_hr))
+
+# Column count
+n_cols <- nrow(dbGetQuery(con, "DESCRIBE final_dataset"))
+cat(sprintf("Number of variables: %d\n", n_cols))
+```
+
+
+### 26.1 export
+
+```{r step26-2-export-csv}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 26.2: Export to CSV format\n")
+cat(strrep("=", 60), "\n")
+
+# CSV file path
+csv_file <- file.path(output_dir, "final_dataset.csv")
+
+cat("Exporting...\n")
+cat("(For large datasets, this may take a few minutes)\n\n")
+
+# Export directly from DuckDB to CSV
+dbExecute(con, sprintf("
+  COPY final_dataset
+  TO '%s'
+  (HEADER, DELIMITER ',')
+", csv_file))
+
+cat("✓ Exported to CSV file:\n")
+cat("  ", csv_file, "\n")
+
+# Check file size
+file_size <- file.info(csv_file)$size / 1024 / 1024  # MB
+cat(sprintf("  File size: %.2f MB\n", file_size))
+```
+
+### 26.4 data dictionary
+
+
+```{r step26-4-create-data-dictionary}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Step 26.4: Create data dictionary\n")
+cat(strrep("=", 60), "\n")
+
+# Data dictionary with detailed variable descriptions
+data_dict <- data.frame(
+  Variable_Name = character(),
+  Category = character(),
+  Data_Type = character(),
+  Description = character(),
+  Unit = character(),
+  Value_Range = character(),
+  stringsAsFactors = FALSE
+)
+
+# Add descriptions for each category's variables
+dict_entries <- list(
+  # Identifiers & Time
+  list("stay_id", "Identifiers & Time", "INTEGER", "ICU stay ID (unique identifier)", "-", "-"),
+  list("hr", "Identifiers & Time", "INTEGER", "Hours since ICU admission", "hours", "≥0"),
+  list("time", "Identifiers & Time", "INTEGER", "Hours since HFNC start", "hours", "any"),
+
+  # Basic ID
+  list("subject_id", "Static: Basic ID", "INTEGER", "Patient ID", "-", "-"),
+  list("hadm_id", "Static: Basic ID", "INTEGER", "Hospital admission ID", "-", "-"),
+
+  # Patient Demographics
+  list("gender", "Static: Patient Demographics", "VARCHAR", "Gender", "-", "M/F"),
+  list("anchor_age", "Static: Patient Demographics", "INTEGER", "Anchor age", "years", "0-91"),
+  list("anchor_year", "Static: Patient Demographics", "INTEGER", "Anchor year", "year", "-"),
+  list("anchor_year_group", "Static: Patient Demographics", "VARCHAR", "Age group", "-", "-"),
+
+  # Admission Info
+  list("insurance", "Static: Admission Info", "VARCHAR", "Insurance type", "-", "-"),
+  list("language", "Static: Admission Info", "VARCHAR", "Language", "-", "-"),
+  list("marital_status", "Static: Admission Info", "VARCHAR", "Marital status", "-", "-"),
+  list("race", "Static: Admission Info", "VARCHAR", "Race", "-", "-"),
+  list("admission_type", "Static: Admission Info", "VARCHAR", "Admission type", "-", "-"),
+  list("admission_location", "Static: Admission Info", "VARCHAR", "Admission location", "-", "-"),
+  list("discharge_location", "Static: Admission Info", "VARCHAR", "Discharge location", "-", "-"),
+  list("admittime", "Static: Admission Info", "TIMESTAMP", "Hospital admission time", "-", "-"),
+  list("dischtime", "Static: Admission Info", "TIMESTAMP", "Hospital discharge time", "-", "-"),
+  list("deathtime", "Static: Admission Info", "TIMESTAMP", "Death time", "-", "-"),
+
+  # ICU Info
+  list("first_careunit", "Static: ICU Info", "VARCHAR", "First care unit", "-", "-"),
+  list("last_careunit", "Static: ICU Info", "VARCHAR", "Last care unit", "-", "-"),
+  list("intime", "Static: ICU Info", "TIMESTAMP", "ICU admission time", "-", "-"),
+  list("outtime", "Static: ICU Info", "TIMESTAMP", "ICU discharge time", "-", "-"),
+  list("los", "Static: ICU Info", "DOUBLE", "ICU length of stay", "days", "≥0"),
+
+  # Elixhauser Scores
+  list("elixhauser_vanwalraven", "Static: Elixhauser Scores", "INTEGER", "van Walraven score", "points", "-"),
+  list("elixhauser_SID29", "Static: Elixhauser Scores", "INTEGER", "SID29 score", "points", "-"),
+  list("elixhauser_SID30", "Static: Elixhauser Scores", "INTEGER", "SID30 score", "points", "-"),
+  
+  # HFNC-related (newly added)
+  list("first_hfnc_start", "Time-series: HFNC-related", "TIMESTAMP", "First HFNC start time", "-", "-"),
+  list("hr_at_hfnc_start", "Time-series: HFNC-related", "INTEGER", "hr at HFNC start", "hours", "≥0"),
+  list("original_hfnc_start", "Time-series: HFNC-related", "TIMESTAMP", "Original HFNC start time", "-", "-"),
+  list("original_hr_at_hfnc_start", "Time-series: HFNC-related", "INTEGER", "Original hr at HFNC start", "hours", "-"),
+
+  # Death/Discharge Events (newly added)
+  list("deathtime_inhosp", "Time-series: Death/Discharge", "TIMESTAMP", "In-hospital death time", "-", "-"),
+  list("dod", "Time-series: Death/Discharge", "DATE", "Date of death", "-", "-"),
+  list("death_datetime", "Time-series: Death/Discharge", "TIMESTAMP", "Death datetime", "-", "-"),
+  list("death_location", "Time-series: Death/Discharge", "VARCHAR", "Death location", "-", "-"),
+  list("time_to_death", "Time-series: Death/Discharge", "DOUBLE", "Time to death", "hours", "≥0"),
+  list("death_30day", "Time-series: Death/Discharge", "INTEGER", "30-day mortality", "binary", "0/1"),
+  list("hr_at_death", "Time-series: Death/Discharge", "INTEGER", "hr at death", "hours", "-"),
+  list("hr_at_icu_discharge", "Time-series: Death/Discharge", "INTEGER", "hr at ICU discharge", "hours", "-"),
+  list("hr_at_hosp_discharge", "Time-series: Death/Discharge", "INTEGER", "hr at hospital discharge", "hours", "-"),
+  list("death_event", "Time-series: Death/Discharge", "INTEGER", "Death event", "binary", "0/1"),
+  list("icu_discharge_event", "Time-series: Death/Discharge", "INTEGER", "ICU discharge event", "binary", "0/1"),
+  list("hosp_discharge_event", "Time-series: Death/Discharge", "INTEGER", "Hospital discharge event", "binary", "0/1"),
+
+  # Outcome
+  list("discharge_outcome", "Time-series: Outcome", "INTEGER", "Discharge event (ICU or hospital)", "binary", "0/1"),
+
+  # Ventilation
+  list("invasive", "Time-series: Ventilation", "INTEGER", "Invasive mechanical ventilation", "binary", "0/1"),
+  list("noninvasive", "Time-series: Ventilation", "INTEGER", "Non-invasive ventilation", "binary", "0/1"),
+  list("highflow", "Time-series: Ventilation", "INTEGER", "High-flow nasal cannula (HFNC)", "binary", "0/1"),
+
+  # Vital Signs
+  list("heart_rate", "Time-series: Vital Signs", "DOUBLE", "Heart rate", "bpm", "0-300"),
+  list("sbp", "Time-series: Vital Signs", "DOUBLE", "Systolic BP (invasive)", "mmHg", "0-300"),
+  list("dbp", "Time-series: Vital Signs", "DOUBLE", "Diastolic BP (invasive)", "mmHg", "0-200"),
+  list("mbp", "Time-series: Vital Signs", "DOUBLE", "Mean BP (invasive)", "mmHg", "0-250"),
+  list("sbp_ni", "Time-series: Vital Signs", "DOUBLE", "Systolic BP (non-invasive)", "mmHg", "0-300"),
+  list("dbp_ni", "Time-series: Vital Signs", "DOUBLE", "Diastolic BP (non-invasive)", "mmHg", "0-200"),
+  list("mbp_ni", "Time-series: Vital Signs", "DOUBLE", "Mean BP (non-invasive)", "mmHg", "0-250"),
+  list("resp_rate", "Time-series: Vital Signs", "DOUBLE", "Respiratory rate", "breaths/min", "0-70"),
+  list("temperature", "Time-series: Vital Signs", "DOUBLE", "Temperature", "°C", "25-45"),
+  list("spo2", "Time-series: Vital Signs", "DOUBLE", "Oxygen saturation", "%", "0-100"),
+  list("glucose", "Time-series: Vital Signs", "DOUBLE", "Glucose (fingerstick)", "mg/dL", "0-1000"),
+
+  # Ventilator Settings
+  list("fio2", "Time-series: Ventilator Settings", "DOUBLE", "Fraction of inspired oxygen", "fraction", "0.21-1.0"),
+  list("o2_flow", "Time-series: Ventilator Settings", "DOUBLE", "Oxygen flow", "L/min", "0-100"),
+  list("o2_flow_additional", "Time-series: Ventilator Settings", "DOUBLE", "Additional oxygen flow", "L/min", "0-100"),
+  list("o2_flow_total", "Time-series: Ventilator Settings", "DOUBLE", "Total oxygen flow", "L/min", "0-200"),
+
+  # Vasopressors
+  list("norepinephrine", "Time-series: Vasopressors", "DOUBLE", "Norepinephrine dose", "mcg/kg/min", "≥0"),
+  list("epinephrine", "Time-series: Vasopressors", "DOUBLE", "Epinephrine dose", "mcg/kg/min", "≥0"),
+  list("dopamine", "Time-series: Vasopressors", "DOUBLE", "Dopamine dose", "mcg/kg/min", "≥0"),
+  list("phenylephrine", "Time-series: Vasopressors", "DOUBLE", "Phenylephrine dose", "mcg/kg/min", "≥0"),
+  list("dobutamine", "Time-series: Vasopressors", "DOUBLE", "Dobutamine dose", "mcg/kg/min", "≥0"),
+  list("vasopressor", "Time-series: Vasopressors", "INTEGER", "Vasopressor use flag", "binary", "0/1"),
+
+  # Blood Gas (including additions)
+  list("ph", "Time-series: Blood Gas", "DOUBLE", "pH", "-", "6.5-8.0"),
+  list("po2", "Time-series: Blood Gas", "DOUBLE", "Partial pressure of oxygen", "mmHg", "0-700"),
+  list("pco2", "Time-series: Blood Gas", "DOUBLE", "Partial pressure of CO2", "mmHg", "0-200"),
+  list("lactate", "Time-series: Blood Gas", "DOUBLE", "Lactate", "mmol/L", "0-30"),
+  list("pao2fio2ratio", "Time-series: Blood Gas", "DOUBLE", "P/F ratio", "mmHg", "0-600"),
+  list("baseexcess", "Time-series: Blood Gas", "DOUBLE", "Base excess", "mEq/L", "-30 to +30"),
+  list("bicarbonate", "Time-series: Blood Gas", "DOUBLE", "Bicarbonate", "mEq/L", "10-40"),
+
+  # Chemistry (including additions)
+  list("creatinine", "Time-series: Chemistry", "DOUBLE", "Creatinine", "mg/dL", "0-20"),
+  list("sodium", "Time-series: Chemistry", "DOUBLE", "Sodium", "mEq/L", "100-180"),
+  list("potassium", "Time-series: Chemistry", "DOUBLE", "Potassium", "mEq/L", "1-10"),
+  list("chloride", "Time-series: Chemistry", "DOUBLE", "Chloride", "mEq/L", "70-150"),
+  list("bun", "Time-series: Chemistry", "DOUBLE", "Blood urea nitrogen", "mg/dL", "0-200"),
+  list("glucose_chem", "Time-series: Chemistry", "DOUBLE", "Glucose (chemistry)", "mg/dL", "0-1000"),
+
+  # CBC
+  list("wbc", "Time-series: CBC", "DOUBLE", "White blood cell count", "K/μL", "0-100"),
+  list("hemoglobin", "Time-series: CBC", "DOUBLE", "Hemoglobin", "g/dL", "0-25"),
+  list("hematocrit", "Time-series: CBC", "DOUBLE", "Hematocrit", "%", "0-70"),
+  list("platelet", "Time-series: CBC", "DOUBLE", "Platelet count", "K/μL", "0-1500"),
+
+  # Treatment
+  list("crrt", "Time-series: Treatment", "INTEGER", "Continuous renal replacement therapy", "binary", "0/1"),
+
+  # Scores
+  list("sofa_24hours", "Time-series: Scores", "INTEGER", "SOFA total score (past 24h)", "points", "0-24"),
+  list("respiration_24hours", "Time-series: Scores", "INTEGER", "SOFA respiration score", "points", "0-4"),
+  list("coagulation_24hours", "Time-series: Scores", "INTEGER", "SOFA coagulation score", "points", "0-4"),
+  list("liver_24hours", "Time-series: Scores", "INTEGER", "SOFA liver score", "points", "0-4"),
+  list("cardiovascular_24hours", "Time-series: Scores", "INTEGER", "SOFA cardiovascular score", "points", "0-4"),
+  list("cns_24hours", "Time-series: Scores", "INTEGER", "SOFA CNS score", "points", "0-4"),
+  list("renal_24hours", "Time-series: Scores", "INTEGER", "SOFA renal score", "points", "0-4"),
+  list("sepsis3", "Time-series: Scores", "INTEGER", "Sepsis-3 diagnosis", "binary", "0/1")
+)
+
+# Add Elixhauser comorbidities (31 variables)
+elixhauser_vars <- list(
+  list("CONGESTIVE_HEART_FAILURE", "Congestive heart failure"),
+  list("CARDIAC_ARRHYTHMIAS", "Cardiac arrhythmias"),
+  list("VALVULAR_DISEASE", "Valvular disease"),
+  list("PULMONARY_CIRCULATION", "Pulmonary circulation disorders"),
+  list("PERIPHERAL_VASCULAR", "Peripheral vascular disease"),
+  list("HYPERTENSION", "Hypertension"),
+  list("PARALYSIS", "Paralysis"),
+  list("OTHER_NEUROLOGICAL", "Other neurological disorders"),
+  list("CHRONIC_PULMONARY", "Chronic pulmonary disease"),
+  list("DIABETES_UNCOMPLICATED", "Diabetes uncomplicated"),
+  list("DIABETES_COMPLICATED", "Diabetes complicated"),
+  list("HYPOTHYROIDISM", "Hypothyroidism"),
+  list("RENAL_FAILURE", "Renal failure"),
+  list("LIVER_DISEASE", "Liver disease"),
+  list("PEPTIC_ULCER", "Peptic ulcer"),
+  list("AIDS", "AIDS/HIV"),
+  list("LYMPHOMA", "Lymphoma"),
+  list("METASTATIC_CANCER", "Metastatic cancer"),
+  list("SOLID_TUMOR", "Solid tumor"),
+  list("RHEUMATOID_ARTHRITIS", "Rheumatoid arthritis"),
+  list("COAGULOPATHY", "Coagulopathy"),
+  list("OBESITY", "Obesity"),
+  list("WEIGHT_LOSS", "Weight loss"),
+  list("FLUID_ELECTROLYTE", "Fluid and electrolyte disorders"),
+  list("BLOOD_LOSS_ANEMIA", "Blood loss anemia"),
+  list("DEFICIENCY_ANEMIAS", "Deficiency anemias"),
+  list("ALCOHOL_ABUSE", "Alcohol abuse"),
+  list("DRUG_ABUSE", "Drug abuse"),
+  list("PSYCHOSES", "Psychoses"),
+  list("DEPRESSION", "Depression")
+)
+
+for (item in elixhauser_vars) {
+  dict_entries[[length(dict_entries) + 1]] <- list(
+    item[[1]], "Static: Elixhauser Comorbidities", "INTEGER",
+    item[[2]], "binary", "0/1"
+  )
+}
+
+# Convert to data frame
+for (entry in dict_entries) {
+  data_dict <- rbind(
+    data_dict,
+    data.frame(
+      Variable_Name = entry[[1]],
+      Category = entry[[2]],
+      Data_Type = entry[[3]],
+      Description = entry[[4]],
+      Unit = entry[[5]],
+      Value_Range = entry[[6]],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+# Save data dictionary
+dict_file <- file.path(output_dir, "data_dictionary.csv")
+write.csv(data_dict, dict_file, row.names = FALSE, fileEncoding = "UTF-8")
+
+cat("✓ Data dictionary created:\n")
+cat("  ", dict_file, "\n")
+cat("  Number of variables:", nrow(data_dict), "\n")
+```
+
+
+# Disconnect
+```{r disconnect-database}
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("Disconnect from DuckDB\n")
+cat(strrep("=", 60), "\n")
+
+# Disconnect from DuckDB
+if (exists("con") && !is.null(con)) {
+  dbDisconnect(con, shutdown = TRUE)
+  cat("✓ Disconnected from DuckDB\n")
+} else {
+  cat("⚠ Connection does not exist\n")
+}
+
+# Garbage collection (free memory)
+gc()
+
+cat("✓ Memory freed\n")
+cat("\n")
+cat(strrep("=", 60), "\n")
+cat("All processing completed\n")
+cat(strrep("=", 60), "\n")
+```

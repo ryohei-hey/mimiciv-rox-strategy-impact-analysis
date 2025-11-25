@@ -1,0 +1,3961 @@
+---
+title: "HFNC Data Extraction - Part 2: Time varying data"
+author: "Ryohei"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+---
+
+# Document Overview
+
+## Purpose
+This document extracts **time-varying clinical variables** and adds them to the person-hourly dataset created in Part 1. Each variable is extracted hourly and joined to create a comprehensive dataset containing patient identifiers, time variables, clinical measurements, vital signs, laboratory values, and clinical scores.
+
+## What This File Does
+
+### Primary Objectives
+1. **Extract hourly clinical variables** from MIMIC-IV tables (chartevents, derived tables)
+2. **Apply forward filling** to propagate last-observed values where appropriate
+3. **Calculate clinical scores** (SOFA, Sepsis-3) based on extracted variables
+4. **Build comprehensive person-hourly dataset** with all time-varying covariates
+
+### Key Output
+- **`person_hourly_final`**: Complete person-hourly dataset with all clinical variables
+  - One row per patient per hour
+  - Contains all variables from Part 1 plus ~70 clinical variables
+  - Ready for statistical analysis and outcome modeling
+
+### Processing Steps Summary
+
+| Step | Category | Variables Added | Forward Fill Strategy |
+|------|----------|----------------|----------------------|
+| 9 | Ventilator data | 3 binary variables (invasive, noninvasive, highflow) | Episode-based (no fill) |
+| 9.5 | Code Status | 5 binary variables (fullcode, cmo, dni, dnr, dnr_dni) | Unlimited forward fill |
+| 10 | FiO2 | 1 variable (fio2) | Unlimited forward fill with g-counter |
+| 11 | Vasopressors/Inotropes | 5 binary variables (norepinephrine, epinephrine, etc.) | Episode-based (no fill) |
+| 12 | Vital Signs | 11 variables (HR, BP, RR, temp, SpO2, glucose) | Unlimited forward fill with g-counter |
+| 13 | O2 Flow | 3 variables (o2_flow, o2_flow_additional, o2_flow_total) | Unlimited forward fill with g-counter |
+| 14 | ABG | 8 variables (pH, PaO2, PaCO2, lactate, etc.) | Unlimited forward fill with g-counter |
+| 14.6 | Chemistry | 6 variables (creatinine, sodium, potassium, etc.) | **48-hour limited** forward fill |
+| 14.7 | CBC | 4 variables (WBC, hemoglobin, hematocrit, platelet) | **48-hour limited** forward fill |
+| 15 | CRRT | 1 binary variable (rrt) | Episode-based (no fill) |
+| 16 | GCS | 4 variables (gcs, gcs_eyes, gcs_verbal, gcs_motor) | **24-hour limited** forward fill |
+| 17 | Derived Tables | 7 derived tables for SOFA calculation | N/A (intermediate tables) |
+| 18 | Suspicion of Infection | 1 table (derived_suspicion_of_infection) | N/A (derived table) |
+| 19 | SOFA Score | 13 variables (6 component scores + 7 rolling scores) | 24-hour rolling window |
+| 20 | Sepsis-3 | 1 table (derive_sepsis3) | N/A (diagnosis table) |
+
+### Forward Filling Strategy
+
+This file uses three forward filling approaches:
+
+1. **Unlimited Forward Fill** (Steps 10, 12, 13, 14 ABG)
+   - Last observation carried forward indefinitely
+   - Used for: FiO2, vital signs, O2 flow, arterial blood gas
+   - Implementation: g-counter logic with window functions
+
+2. **Time-Limited Forward Fill** (Steps 14.6, 14.7, 16)
+   - Last observation carried forward for specified duration only
+   - 48 hours: Chemistry labs, CBC
+   - 24 hours: GCS scores
+   - Values become NULL after time limit expires
+
+3. **Episode-Based (No Fill)** (Steps 9, 11, 15)
+   - Binary indicators (0/1) for current status
+   - No forward filling applied
+   - Used for: Ventilator modes, vasopressors, CRRT
+
+### G-Counter Logic
+The "g-counter" technique enables efficient forward filling in SQL:
+```sql
+COUNT(value) OVER (PARTITION BY stay_id ORDER BY hr) AS g
+MAX(value) OVER (PARTITION BY stay_id, g ORDER BY hr)
+```
+- Creates groups where non-NULL values increment the counter
+- MAX within each group propagates the last observed value forward
+
+### Clinical Scores Calculated
+
+**SOFA Score (Sequential Organ Failure Assessment)**
+- 6 component scores (Respiration, Coagulation, Liver, Cardiovascular, CNS, Renal)
+- Each scored 0-4 points based on worst value in 24-hour window
+- Total score: 0-24 points
+- Used for: Sepsis-3 diagnosis, mortality risk assessment
+
+**Sepsis-3 Diagnosis**
+- Criteria: Suspected infection + SOFA ≥2
+- Suspected infection: Culture + antibiotic within specific time window
+- Evaluation period: 48 hours before to 24 hours after suspected infection
+
+### Data Sources
+
+| Data Type | MIMIC-IV Source | Processing Method |
+|-----------|----------------|-------------------|
+| Ventilator settings | chartevents | Episode detection |
+| Vital signs | chartevents (via derived_vitalsign) | Forward fill + aggregation |
+| Laboratory values | derived_bg, derived_chemistry, derived_complete_blood_count | Forward fill with time limits |
+| Medications | inputevents (via derived tables) | Episode detection |
+| Clinical scores | Calculated from multiple sources | Rolling windows |
+
+### Prerequisites
+This file requires successful completion of Part 1 (01_Basic_hourly_data.qmd), which creates:
+- `hfnc_cohort_final`: Patient-level cohort
+- `person_hourly_censored`: Base person-hourly structure
+- `icu_stays_base`: ICU admission information
+- `invasive_noninvasive_highflow`: Ventilator episode data
+
+### Subsequent Analysis
+After this file completes:
+- **File 03**: Calculate derived covariates, apply inclusion/exclusion criteria, perform statistical analysis
+
+---
+
+# Setup
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(duckdb)
+library(tidyverse)
+library(here)
+
+#dbDisconnect(con, shutdown = TRUE)
+
+# Garbage collection (free memory)
+gc()
+
+# Close existing connection if exists
+if (exists("con") && !is.null(con)) {
+  try(dbDisconnect(con, shutdown = TRUE), silent = TRUE)
+}
+
+# Clean up environment (remove everything except con and library objects)
+rm(list = setdiff(ls(), c("con")))
+
+# Garbage collection (free memory)
+gc()
+
+cat("✓ Cleaned up environment\n")
+cat("✓ Freed memory\n\n")
+
+# Path to DuckDB file
+db_path <- "C:/Users/ryohe/Dropbox (個人)/Research/mimic_projects/mimic_analysis/data/mimic.duckdb"
+
+# Check if file exists
+if (!file.exists(db_path)) {
+  stop("DuckDB file not found: ", db_path)
+}
+
+# Reconnect to DuckDB
+con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = FALSE)
+
+cat("✓ Connected to DuckDB\n")
+cat("  Database path:", db_path, "\n")
+```
+
+
+## Step 9: Convert Ventilator Data to Hourly Timeline and Binary Variables
+
+### Purpose
+From the `invasive_noninvasive_highflow` table (start/end time pairs), record whether each type of ventilator was in use at each time point (hr) as binary variables (0/1).
+
+### Processing Details
+1. Extract each ventilator episode (starttime ~ endtime)
+2. Convert to elapsed hours (hr) from ICU admission time (intime)
+3. Determine whether a ventilator was in use at each hr time point
+4. Create 3 binary variables: invasive, noninvasive, highflow
+
+
+### Convert to Hourly Timeline
+
+```{r step9-convert-to-hourly}
+# Convert ventilator episodes to hourly format
+dbExecute(con, "
+  CREATE OR REPLACE TABLE ventilation_hourly AS
+
+  WITH vent_with_intime AS (
+      -- Join ventilator data with ICU admission time (HFNC patients only)
+      SELECT
+          v.stay_id,
+          v.ventilation_status,
+          v.starttime,
+          v.endtime,
+          h.intime,
+          -- Calculate start_hr
+          CAST(FLOOR(EXTRACT(EPOCH FROM (v.starttime - h.intime)) / 3600) AS INTEGER) AS start_hr,
+          -- Calculate end_hr
+          CAST(FLOOR(EXTRACT(EPOCH FROM (v.endtime - h.intime)) / 3600) AS INTEGER) AS end_hr
+      FROM invasive_noninvasive_highflow v
+      INNER JOIN hfnc_cohort_final h
+          ON v.stay_id = h.stay_id
+      -- Exclude data errors (starttime > endtime) as defensive programming
+      WHERE v.starttime <= v.endtime
+  ),
+
+  vent_expanded AS (
+      -- Generate each hr from start_hr to end_hr
+      SELECT
+          stay_id,
+          ventilation_status,
+          unnest(range(start_hr, end_hr + 1)) AS hr
+      FROM vent_with_intime
+      -- Verify start_hr <= end_hr just to be safe
+      WHERE start_hr <= end_hr
+  )
+
+  SELECT
+      stay_id,
+      hr,
+      MAX(CASE WHEN ventilation_status = 'Invasive' THEN 1 ELSE 0 END) AS invasive,
+      MAX(CASE WHEN ventilation_status = 'Noninvasive' THEN 1 ELSE 0 END) AS noninvasive,
+      MAX(CASE WHEN ventilation_status = 'HighFlow' THEN 1 ELSE 0 END) AS highflow
+  FROM vent_expanded
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Created table ventilation_hourly\n")
+```
+
+### Join to Person-Hourly Data
+
+```{r step9-join-to-base}
+# Join ventilator data to person_hourly_censored
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_vent AS
+  SELECT
+      p.*,
+      COALESCE(v.invasive, 0) AS invasive,
+      COALESCE(v.noninvasive, 0) AS noninvasive,
+      COALESCE(v.highflow, 0) AS highflow
+  FROM person_hourly_censored p
+  LEFT JOIN ventilation_hourly v
+      ON p.stay_id = v.stay_id
+      AND p.hr = v.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_vent\n")
+```
+
+
+## Step 9.5: Add Code Status Variables
+
+### Purpose
+Extract code status data (DNR, DNI, CMO, etc.) from derived_code_status, apply forward filling, and add to person_hourly_with_vent as binary variables.
+
+### Variables to Extract (5 variables)
+1. fullcode - Full code status (1 = full code, 0 = otherwise)
+2. cmo - Comfort measures only (1 = CMO, 0 = otherwise)
+3. dni - Do not intubate (1 = DNI, 0 = otherwise)
+4. dnr - Do not resuscitate (1 = DNR, 0 = otherwise)
+5. dnr_dni - Combined DNR and DNI status
+
+### Processing Approach
+1. Convert derived_code_status to hourly units from ICU admission
+2. Aggregate latest records for each hr
+3. Create all hour combinations matching person_hourly_with_vent
+4. Apply forward filling with independent g-counter for each variable
+5. Set default values: fullcode=1, others=0 if no prior code status
+6. Join to person_hourly_with_vent (overwrite existing table)
+
+### Implementation Details
+
+```{r step9-5-code-status}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 9.5: Add Code Status Variables\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Step 1: Convert derived_code_status to hr based on ICU admission time
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_with_hr AS
+  SELECT
+      cs.stay_id,
+      cs.charttime,
+      -- Elapsed time from ICU admission (in hours, rounded down)
+      CAST(
+          FLOOR(
+              EXTRACT(EPOCH FROM (cs.charttime - ie.intime)) / 3600.0
+          ) AS INTEGER
+      ) AS hr,
+      cs.fullcode,
+      cs.cmo,
+      cs.dni,
+      cs.dnr,
+      cs.dnr_dni
+  FROM derived_code_status cs
+  INNER JOIN icu_icustays ie
+      ON cs.stay_id = ie.stay_id
+  WHERE cs.charttime >= ie.intime
+      AND cs.charttime <= ie.outtime
+")
+
+cat("✓ Converted Code Status to hourly units based on ICU admission time\n")
+
+# Step 2: Aggregate the latest records for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_hourly_raw AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(fullcode) AS fullcode,
+      MAX(cmo) AS cmo,
+      MAX(dni) AS dni,
+      MAX(dnr) AS dnr,
+      MAX(dnr_dni) AS dnr_dni
+  FROM code_status_with_hr
+  GROUP BY stay_id, hr
+")
+
+cat("✓ Aggregated latest records for each hr\n")
+
+# Step 3: Create all combinations of the same hr range as person_hourly_with_vent
+# Important: Use only stay_id × hr combinations that already exist in person_hourly_with_vent
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_all_hours AS
+  SELECT DISTINCT
+      stay_id,
+      hr
+  FROM person_hourly_with_vent
+")
+
+cat("✓ Created combinations for the same hr range as person_hourly_with_vent\n")
+
+# Step 4: Perform Forward Fill (g-counter logic)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE code_status_filled AS
+  WITH add_groups AS (
+      SELECT
+          all_hr.stay_id,
+          all_hr.hr,
+          cs.fullcode,
+          cs.cmo,
+          cs.dni,
+          cs.dnr,
+          cs.dnr_dni,
+          -- Independent g-counter for each variable
+          SUM(CASE WHEN cs.fullcode IS NOT NULL THEN 1 ELSE 0 END)
+              OVER (PARTITION BY all_hr.stay_id ORDER BY all_hr.hr) AS g_fullcode,
+          SUM(CASE WHEN cs.cmo IS NOT NULL THEN 1 ELSE 0 END)
+              OVER (PARTITION BY all_hr.stay_id ORDER BY all_hr.hr) AS g_cmo,
+          SUM(CASE WHEN cs.dni IS NOT NULL THEN 1 ELSE 0 END)
+              OVER (PARTITION BY all_hr.stay_id ORDER BY all_hr.hr) AS g_dni,
+          SUM(CASE WHEN cs.dnr IS NOT NULL THEN 1 ELSE 0 END)
+              OVER (PARTITION BY all_hr.stay_id ORDER BY all_hr.hr) AS g_dnr,
+          SUM(CASE WHEN cs.dnr_dni IS NOT NULL THEN 1 ELSE 0 END)
+              OVER (PARTITION BY all_hr.stay_id ORDER BY all_hr.hr) AS g_dnr_dni
+      FROM code_status_all_hours all_hr
+      LEFT JOIN code_status_hourly_raw cs
+          ON all_hr.stay_id = cs.stay_id
+          AND all_hr.hr = cs.hr
+  )
+
+  SELECT
+      stay_id,
+      hr,
+      -- Forward fill: Use first non-NULL value within each group
+      -- If initial value is NULL (g_* = 0), set fullcode=1, others=0
+      COALESCE(
+          FIRST_VALUE(fullcode IGNORE NULLS)
+              OVER (PARTITION BY stay_id, g_fullcode ORDER BY hr),
+          CASE WHEN g_fullcode = 0 THEN 1 ELSE NULL END
+      ) AS fullcode,
+      COALESCE(
+          FIRST_VALUE(cmo IGNORE NULLS)
+              OVER (PARTITION BY stay_id, g_cmo ORDER BY hr),
+          CASE WHEN g_cmo = 0 THEN 0 ELSE NULL END
+      ) AS cmo,
+      COALESCE(
+          FIRST_VALUE(dni IGNORE NULLS)
+              OVER (PARTITION BY stay_id, g_dni ORDER BY hr),
+          CASE WHEN g_dni = 0 THEN 0 ELSE NULL END
+      ) AS dni,
+      COALESCE(
+          FIRST_VALUE(dnr IGNORE NULLS)
+              OVER (PARTITION BY stay_id, g_dnr ORDER BY hr),
+          CASE WHEN g_dnr = 0 THEN 0 ELSE NULL END
+      ) AS dnr,
+      COALESCE(
+          FIRST_VALUE(dnr_dni IGNORE NULLS)
+              OVER (PARTITION BY stay_id, g_dnr_dni ORDER BY hr),
+          CASE WHEN g_dnr_dni = 0 THEN 0 ELSE NULL END
+      ) AS dnr_dni
+  FROM add_groups
+")
+
+cat("✓ Performed Forward Fill\n")
+
+# Step 5: [IMPORTANT] Overwrite existing person_hourly_with_vent and add new columns
+# Table name is unchanged, so no changes needed to subsequent code
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_vent AS
+  SELECT
+      p.*,
+      cs.fullcode,
+      cs.cmo,
+      cs.dni,
+      cs.dnr,
+      cs.dnr_dni
+  FROM person_hourly_with_vent p
+  LEFT JOIN code_status_filled cs
+      ON p.stay_id = cs.stay_id
+      AND p.hr = cs.hr
+")
+
+cat("✓ Added Code Status variables to person_hourly_with_vent\n")
+cat("  (Table name unchanged → no changes needed to subsequent code)\n")
+
+# Clean up temporary tables
+dbExecute(con, "DROP TABLE IF EXISTS code_status_with_hr")
+dbExecute(con, "DROP TABLE IF EXISTS code_status_hourly_raw")
+dbExecute(con, "DROP TABLE IF EXISTS code_status_all_hours")
+dbExecute(con, "DROP TABLE IF EXISTS code_status_filled")
+
+cat("✓ Cleaned up temporary tables\n")
+```
+
+## Step 10: Extract FiO2 Data and Forward Filling
+
+### Purpose
+Extract FiO2 (fraction of inspired oxygen) data from derived_bg (blood gas analysis) and chartevents (ventilator settings), and impute missing values using Forward Filling.
+
+### Processing Strategy
+1. **Prioritize derived_bg** - Actual measured values at blood gas analysis (most accurate)
+2. **Supplement with chartevents** - Improve coverage with ventilator settings
+3. **13_fio2.sql g-logic** - Smart forward filling
+4. **bg.sql conversion logic** - Properly handle value ranges
+
+
+### Step 10.1: Extract FiO2 from derived_bg
+
+```{r step10-1-extract-from-bg}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 10.1: Extract FiO2 from derived_bg\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract FiO2 from derived_bg (same logic as 13_fio2.sql)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_from_bg AS
+  SELECT
+      i.stay_id,
+      bg.charttime,
+      bg.fio2,
+      -- Elapsed time from ICU admission (in hours, rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (bg.charttime - i.intime)) / 3600) AS INTEGER
+      ) AS hr,
+      'derived_bg' AS source
+  FROM icu_stays_base i
+  INNER JOIN derived_bg bg
+      ON i.hadm_id = bg.hadm_id
+      AND i.subject_id = bg.subject_id
+  WHERE i.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+      AND bg.fio2 IS NOT NULL
+      AND bg.charttime >= i.intime  -- After ICU admission only
+      AND bg.fio2 >= 21 AND bg.fio2 <= 100  -- Valid range
+  ORDER BY i.stay_id, hr
+")
+
+cat("✓ Extracted FiO2 from derived_bg\n")
+
+# Check statistics
+bg_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      ROUND(AVG(fio2), 2) as mean_fio2,
+      MIN(fio2) as min_fio2,
+      MAX(fio2) as max_fio2
+  FROM fio2_from_bg
+")
+
+print("derived_bg FiO2 statistics:")
+print(bg_stats)
+```
+
+### Step 10.2: Extract FiO2 from chartevents
+
+```{r step10-2-extract-from-chartevents}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 10.2: Extract FiO2 from chartevents\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Apply bg.sql conversion logic
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_from_chartevents AS
+  SELECT
+      c.stay_id,
+      c.charttime,
+      -- bg.sql conversion logic
+      CASE
+          WHEN c.valuenum > 0 AND c.valuenum <= 1
+          THEN c.valuenum * 100.0
+          WHEN c.valuenum > 1 AND c.valuenum < 20
+          THEN NULL  -- Inaccurate values
+          WHEN c.valuenum >= 20 AND c.valuenum <= 100
+          THEN c.valuenum
+          ELSE NULL
+      END AS fio2,
+      -- Elapsed time from ICU admission
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (c.charttime - i.intime)) / 3600) AS INTEGER
+      ) AS hr,
+      'chartevents' AS source
+  FROM icu_chartevents c
+  INNER JOIN icu_stays_base i
+      ON c.stay_id = i.stay_id
+  WHERE c.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+      AND c.itemid = 223835  -- Inspired O2 Fraction (FiO2)
+      AND c.valuenum > 0
+      AND c.valuenum <= 100
+      AND c.charttime >= i.intime
+")
+
+# Exclude NULL values
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_from_chartevents_clean AS
+  SELECT *
+  FROM fio2_from_chartevents
+  WHERE fio2 IS NOT NULL
+      AND fio2 >= 21 AND fio2 <= 100
+")
+
+cat("✓ Extracted FiO2 from chartevents\n")
+
+# Check statistics
+chart_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      ROUND(AVG(fio2), 2) as mean_fio2,
+      MIN(fio2) as min_fio2,
+      MAX(fio2) as max_fio2
+  FROM fio2_from_chartevents_clean
+")
+
+print("chartevents FiO2 statistics:")
+print(chart_stats)
+```
+
+### Step 10.3: Merge Two Sources (Prioritize derived_bg)
+
+```{r step10-3-merge-sources}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 10.3: Merge FiO2 sources (prioritize derived_bg)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Merge derived_bg and chartevents, prioritizing derived_bg for same (stay_id, hr)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_combined AS
+  WITH all_fio2 AS (
+      SELECT * FROM fio2_from_bg
+      UNION ALL
+      SELECT * FROM fio2_from_chartevents_clean
+  ),
+  -- When multiple FiO2 values exist for same (stay_id, hr), prioritize derived_bg
+  fio2_ranked AS (
+      SELECT
+          stay_id,
+          hr,
+          charttime,
+          fio2,
+          source,
+          ROW_NUMBER() OVER (
+              PARTITION BY stay_id, hr
+              ORDER BY
+                  CASE WHEN source = 'derived_bg' THEN 1 ELSE 2 END,
+                  charttime DESC
+          ) AS rn
+      FROM all_fio2
+      WHERE hr >= 0  -- After ICU admission only
+  )
+  SELECT
+      stay_id,
+      hr,
+      charttime,
+      fio2,
+      source
+  FROM fio2_ranked
+  WHERE rn = 1  -- Only the highest priority value for each (stay_id, hr)
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Merged FiO2 sources\n")
+
+# Statistics by source
+source_stats <- dbGetQuery(con, "
+  SELECT
+      source,
+      COUNT(*) as records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      ROUND(AVG(fio2), 2) as mean_fio2
+  FROM fio2_combined
+  GROUP BY source
+  ORDER BY source
+")
+
+print("Statistics by source:")
+print(source_stats)
+
+# Overall statistics
+combined_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      ROUND(AVG(fio2), 2) as mean_fio2
+  FROM fio2_combined
+")
+
+print("Statistics after merging:")
+print(combined_stats)
+```
+
+### Step 10.4: Forward Filling (13_fio2.sql g-logic)
+
+```{r step10-4-forward-fill}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 10.4: Forward Filling (13_fio2.sql logic)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Apply 13_fio2.sql g-counter logic
+# Step 1: Join fio2 to base table and create g-counter
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_base_table AS
+  SELECT
+      p.stay_id,
+      p.hr,
+      f.charttime,
+      f.fio2,
+      f.source,
+      -- g-counter: Counts up when fio2 exists
+      -- This maintains the same g until the next fio2 appears
+      COUNT(f.fio2) OVER (
+          PARTITION BY p.stay_id
+          ORDER BY p.hr
+      ) AS g
+  FROM person_hourly_with_vent p
+  LEFT JOIN fio2_combined f
+      ON p.stay_id = f.stay_id
+      AND p.hr = f.hr
+  WHERE p.hr >= 0
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created g-counter\n")
+
+# Verify g-counter operation (sample)
+g_sample <- dbGetQuery(con, "
+  SELECT
+      stay_id, hr, fio2, g, source
+  FROM fio2_base_table
+  WHERE stay_id IN (
+      SELECT stay_id FROM fio2_base_table
+      WHERE fio2 IS NOT NULL
+      LIMIT 1
+  )
+  ORDER BY stay_id, hr
+  LIMIT 20
+")
+
+cat("\nVerify g-counter operation (sample):\n")
+print(g_sample)
+
+# Step 2: Forward fill fio2 within each g-group
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_with_last_value AS
+  SELECT
+      stay_id,
+      hr,
+      fio2,
+      g,
+      charttime,
+      source,
+      -- Get maximum fio2 value within each g-group
+      -- MAX function gets the last non-NULL value by skipping NULL values
+      MAX(fio2) OVER (
+          PARTITION BY stay_id, g
+          ORDER BY hr
+      ) AS last_value_fio2
+  FROM fio2_base_table
+")
+
+cat("✓ Performed forward filling\n")
+
+# Step 3: Determine final fio2 value for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE fio2_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(last_value_fio2) AS fio2,
+      MAX(source) as source_original,
+      -- Flag indicating whether forward filling was applied
+      CASE
+          WHEN MAX(fio2) IS NOT NULL THEN 'measured'
+          WHEN MAX(last_value_fio2) IS NOT NULL THEN 'forward_filled'
+          ELSE 'missing'
+      END AS fio2_status
+  FROM fio2_with_last_value
+  WHERE hr >= 0
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Created fio2_forward_filled table\n")
+
+# Statistics after forward filling
+filled_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_hours,
+      COUNT(fio2) as hours_with_fio2,
+      ROUND(COUNT(fio2) * 100.0 / COUNT(*), 2) as coverage_pct,
+      COUNT(DISTINCT stay_id) as total_patients,
+      COUNT(DISTINCT CASE WHEN fio2 IS NOT NULL THEN stay_id END) as patients_with_fio2,
+      ROUND(AVG(fio2), 2) as mean_fio2,
+      COUNT(CASE WHEN fio2_status = 'measured' THEN 1 END) as measured_count,
+      COUNT(CASE WHEN fio2_status = 'forward_filled' THEN 1 END) as forward_filled_count,
+      COUNT(CASE WHEN fio2_status = 'missing' THEN 1 END) as missing_count
+  FROM fio2_forward_filled
+")
+
+print("Statistics after forward filling:")
+print(filled_stats)
+
+cat(sprintf("\n[Coverage] %.1f%%\n", filled_stats$coverage_pct))
+cat(sprintf("  - Measured values: %d hours\n", filled_stats$measured_count))
+cat(sprintf("  - Forward fill: %d hours\n", filled_stats$forward_filled_count))
+cat(sprintf("  - Missing: %d hours\n", filled_stats$missing_count))
+```
+
+### Join to Person-Hourly Data
+
+```{r step10-join-fio2}
+# Join FiO2 to person_hourly data
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_fio2 AS
+  SELECT
+      p.*,
+      f.fio2
+  FROM person_hourly_with_vent p
+  LEFT JOIN fio2_forward_filled f
+      ON p.stay_id = f.stay_id
+      AND p.hr = f.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_fio2\n")
+```
+
+## Step 11: Extract Vasopressor and Inotrope Data
+
+### Purpose
+Extract vasopressor and inotrope administration records from inputevents and record them as individual binary variables (0/1) at each time point (hr).
+
+### Target Medications
+**Vasopressors:**
+- Norepinephrine (itemid: 221906)
+- Epinephrine (itemid: 221289)
+- Dopamine (itemid: 221662)
+- Phenylephrine (itemid: 221749, 229617)
+
+**Inotrope:**
+- Dobutamine (itemid: 221653)
+
+### Output Variables
+- `norepinephrine`: 0/1
+- `epinephrine`: 0/1
+- `dopamine`: 0/1
+- `phenylephrine`: 0/1
+- `vasopressor`: 0/1 (any of the above 4 vasopressors in use)
+
+- `dobutamine`: 0/1
+
+### Step 11.1: Extract All Medication Data
+
+```{r step11-1-extract-drugs}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 11.1: Extract vasopressor and inotrope data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract all medication data from inputevents
+dbExecute(con, "
+  CREATE OR REPLACE TABLE drugs_base AS
+  SELECT
+      inp.stay_id,
+      inp.linkorderid,
+      inp.rate,
+      inp.amount,
+      inp.starttime,
+      inp.endtime,
+      inp.itemid,
+      -- Medication name
+      CASE
+          WHEN inp.itemid = 221906 THEN 'norepinephrine'
+          WHEN inp.itemid = 221289 THEN 'epinephrine'
+          WHEN inp.itemid = 221662 THEN 'dopamine'
+          WHEN inp.itemid IN (221749, 229617) THEN 'phenylephrine'
+          WHEN inp.itemid = 221653 THEN 'dobutamine'
+      END AS drug_name,
+      -- Vasopressor flag (one of the 4 drugs excluding dobutamine)
+      CASE
+          WHEN inp.itemid IN (221906, 221289, 221662, 221749, 229617) THEN 1
+          ELSE 0
+      END AS is_vasopressor
+  FROM icu_inputevents inp
+  WHERE inp.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+      AND inp.itemid IN (
+          221906,  -- Norepinephrine
+          221289,  -- Epinephrine
+          221662,  -- Dopamine
+          221749,  -- Phenylephrine
+          229617,  -- Phenylephrine (alternative)
+          221653   -- Dobutamine
+      )
+      AND inp.starttime IS NOT NULL
+      AND inp.endtime IS NOT NULL
+      AND inp.starttime <= inp.endtime
+")
+
+cat("✓ Extracted vasopressor and inotrope data\n")
+
+```
+
+### Step 11.2: Calculate Administration Duration and Time from ICU Admission
+
+```{r step11-2-calculate-times}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 11.2: Calculate time differences\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+dbExecute(con, "
+  CREATE OR REPLACE TABLE drugs_with_times AS
+
+  WITH add_intime AS (
+      SELECT
+          d.*,
+          i.intime,
+          -- Administration duration (in hours)
+          CAST(
+              FLOOR(EXTRACT(EPOCH FROM (d.endtime - d.starttime)) / 3600) AS INTEGER
+          ) AS drug_duration_hours,
+          -- Time from ICU admission to drug start (in hours)
+          CAST(
+              FLOOR(EXTRACT(EPOCH FROM (d.starttime - i.intime)) / 3600) AS INTEGER
+          ) AS hr_drug_start
+      FROM drugs_base d
+      LEFT JOIN icu_stays_base i
+          ON d.stay_id = i.stay_id
+  )
+
+  SELECT * FROM add_intime
+  WHERE hr_drug_start >= 0  -- Only administrations after ICU admission
+")
+
+cat("✓ Time difference calculation complete\n")
+
+```
+
+### Step 11.3: Expand Administration Period to Hourly Timeline
+
+```{r step11-3-expand-to-hourly}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 11.3: Expand administration period to hourly timeline\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+dbExecute(con, "
+  CREATE OR REPLACE TABLE drugs_expanded AS
+
+  SELECT
+      stay_id,
+      drug_name,
+      is_vasopressor,
+      -- Generate hrs for duration starting from drug start hr
+      hr_drug_start + unnest(range(0, drug_duration_hours + 1)) AS hr
+  FROM drugs_with_times
+  WHERE drug_duration_hours >= 0
+  ORDER BY stay_id, hr, drug_name
+")
+
+cat("✓ Expansion to hourly timeline complete\n")
+
+```
+
+### Step 11.4: Convert Individual Medications to Binary Variables
+
+```{r step11-4-create-individual-flags}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 11.4: Create binary variables for individual medications\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Create binary variables for each medication
+dbExecute(con, "
+  CREATE OR REPLACE TABLE drugs_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(CASE WHEN drug_name = 'norepinephrine' THEN 1 ELSE 0 END) AS norepinephrine,
+      MAX(CASE WHEN drug_name = 'epinephrine' THEN 1 ELSE 0 END) AS epinephrine,
+      MAX(CASE WHEN drug_name = 'dopamine' THEN 1 ELSE 0 END) AS dopamine,
+      MAX(CASE WHEN drug_name = 'phenylephrine' THEN 1 ELSE 0 END) AS phenylephrine,
+      MAX(CASE WHEN drug_name = 'dobutamine' THEN 1 ELSE 0 END) AS dobutamine,
+      -- vasopressor: any of the 4 vasopressors in use
+      MAX(is_vasopressor) AS vasopressor
+  FROM drugs_expanded
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Created binary variables for individual medications\n")
+
+```
+
+### Join to Person-Hourly Data
+
+```{r step11-5-join-to-base}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 11.5: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join medication data to person_hourly_with_fio2
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_drugs AS
+  SELECT
+      p.*,
+      COALESCE(d.norepinephrine, 0) AS norepinephrine,
+      COALESCE(d.epinephrine, 0) AS epinephrine,
+      COALESCE(d.dopamine, 0) AS dopamine,
+      COALESCE(d.phenylephrine, 0) AS phenylephrine,
+      COALESCE(d.dobutamine, 0) AS dobutamine,
+      COALESCE(d.vasopressor, 0) AS vasopressor
+  FROM person_hourly_with_fio2 p
+  LEFT JOIN drugs_hourly d
+      ON p.stay_id = d.stay_id
+      AND p.hr = d.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_drugs\n")
+cat("  Added variables: norepinephrine, epinephrine, dopamine, phenylephrine, dobutamine, vasopressor\n")
+```
+
+
+## Step 12: Extract Vital Signs Data
+
+### Purpose
+Extract vital signs data from chartevents, create the derived_vitalsign table, convert to hourly units, and apply forward filling.
+
+### Vital Signs to Extract (11 Variables)
+1. heart_rate - Heart rate
+2. sbp - Systolic blood pressure (arterial)
+3. dbp - Diastolic blood pressure (arterial)
+4. mbp - Mean blood pressure (arterial)
+5. sbp_ni - Systolic blood pressure (non-invasive)
+6. dbp_ni - Diastolic blood pressure (non-invasive)
+7. mbp_ni - Mean blood pressure (non-invasive)
+8. resp_rate - Respiratory rate
+9. temperature - Temperature
+10. spo2 - Oxygen saturation
+11. glucose - Blood glucose
+
+### Processing Strategy
+1. Create derived_vitalsign using vitalsign.sql
+2. Convert to hourly units from ICU admission
+3. Forward filling with independent g-counter for each variable
+4. Join to person_hourly_with_drugs
+
+
+
+## Step 12.1: Create derived_vitalsign Table
+
+```{r step12-1-create-derived-vitalsign}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 12.1: Create derived_vitalsign table\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Create derived_vitalsign using vitalsign.sql logic
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_vitalsign AS
+  SELECT
+      ce.subject_id,
+      ce.stay_id,
+      ce.charttime,
+      -- Heart Rate
+      AVG(CASE 
+          WHEN itemid IN (220045)
+              AND valuenum > 0
+              AND valuenum < 300
+          THEN valuenum 
+      END) AS heart_rate,
+      -- Systolic BP (arterial)
+      AVG(CASE 
+          WHEN itemid IN (220179, 220050, 225309)
+              AND valuenum > 0
+              AND valuenum < 400
+          THEN valuenum 
+      END) AS sbp,
+      -- Diastolic BP (arterial)
+      AVG(CASE 
+          WHEN itemid IN (220180, 220051, 225310)
+              AND valuenum > 0
+              AND valuenum < 300
+          THEN valuenum 
+      END) AS dbp,
+      -- Mean BP (arterial)
+      AVG(CASE 
+          WHEN itemid IN (220052, 220181, 225312)
+              AND valuenum > 0
+              AND valuenum < 300
+          THEN valuenum 
+      END) AS mbp,
+      -- Non-invasive Systolic BP
+      AVG(CASE 
+          WHEN itemid = 220179
+              AND valuenum > 0
+              AND valuenum < 400
+          THEN valuenum 
+      END) AS sbp_ni,
+      -- Non-invasive Diastolic BP
+      AVG(CASE 
+          WHEN itemid = 220180
+              AND valuenum > 0
+              AND valuenum < 300
+          THEN valuenum 
+      END) AS dbp_ni,
+      -- Non-invasive Mean BP
+      AVG(CASE 
+          WHEN itemid = 220181
+              AND valuenum > 0
+              AND valuenum < 300
+          THEN valuenum 
+      END) AS mbp_ni,
+      -- Respiratory Rate
+      AVG(CASE 
+          WHEN itemid IN (220210, 224690)
+              AND valuenum > 0
+              AND valuenum < 70
+          THEN valuenum 
+      END) AS resp_rate,
+      -- Temperature (converted to Celsius)
+      ROUND(CAST(
+          AVG(CASE
+              -- Fahrenheit to Celsius conversion
+              WHEN itemid IN (223761)
+                  AND valuenum > 70
+                  AND valuenum < 120
+              THEN (valuenum - 32) / 1.8
+              -- Already in Celsius
+              WHEN itemid IN (223762)
+                  AND valuenum > 10
+                  AND valuenum < 50
+              THEN valuenum 
+          END) AS NUMERIC), 2) AS temperature,
+      -- SpO2
+      AVG(CASE 
+          WHEN itemid IN (220277)
+              AND valuenum > 0
+              AND valuenum <= 100
+          THEN valuenum 
+      END) AS spo2,
+      -- Glucose
+      AVG(CASE 
+          WHEN itemid IN (225664, 220621, 226537)
+              AND valuenum > 0
+          THEN valuenum 
+      END) AS glucose
+  FROM icu_chartevents ce
+  WHERE ce.stay_id IS NOT NULL
+      AND ce.itemid IN (
+          220045,  -- Heart Rate
+          225309,  -- ART BP Systolic
+          225310,  -- ART BP Diastolic
+          225312,  -- ART BP Mean
+          220050,  -- Arterial Blood Pressure systolic
+          220051,  -- Arterial Blood Pressure diastolic
+          220052,  -- Arterial Blood Pressure mean
+          220179,  -- Non Invasive Blood Pressure systolic
+          220180,  -- Non Invasive Blood Pressure diastolic
+          220181,  -- Non Invasive Blood Pressure mean
+          220210,  -- Respiratory Rate
+          224690,  -- Respiratory Rate (Total)
+          220277,  -- SPO2, peripheral
+          225664,  -- Glucose finger stick
+          220621,  -- Glucose (serum)
+          226537,  -- Glucose (whole blood)
+          223762,  -- Temperature Celsius
+          223761   -- Temperature Fahrenheit
+      )
+  GROUP BY ce.subject_id, ce.stay_id, ce.charttime
+")
+
+cat("✓ Created derived_vitalsign table\n")
+
+```
+
+
+
+## Step 12.2: Convert to Hourly Units
+
+```{r step12-2-convert-to-hr}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 12.2: Convert to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# 15_vital_signs.sql logic: Convert to hourly units from ICU admission
+dbExecute(con, "
+  CREATE OR REPLACE TABLE vitalsign_with_hr AS
+  SELECT
+      vs.charttime,
+      vs.heart_rate,
+      vs.sbp,
+      vs.dbp,
+      vs.mbp,
+      vs.sbp_ni,
+      vs.dbp_ni,
+      vs.mbp_ni,
+      vs.resp_rate,
+      vs.temperature,
+      vs.spo2,
+      vs.glucose,
+      icu.stay_id,
+      -- Elapsed time from ICU admission (in hours, rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (vs.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_vitalsign vs
+      ON icu.stay_id = vs.stay_id
+  WHERE vs.charttime >= icu.intime  -- After ICU admission only
+")
+
+cat("✓ Conversion to hourly units complete\n")
+
+```
+
+
+
+## Step 12.3: Forward Filling (15_vital_signs.sql g-logic)
+
+```{r step12-3-forward-fill}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 12.3: Forward Filling (g-counter logic)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# 15_vital_signs.sql logic: Independent g-counter for each variable
+dbExecute(con, "
+  CREATE OR REPLACE TABLE vitalsign_with_groups AS
+  SELECT
+      b.stay_id,
+      b.hr,
+      v.charttime,
+      v.heart_rate,
+      v.sbp,
+      v.dbp,
+      v.mbp,
+      v.sbp_ni,
+      v.dbp_ni,
+      v.mbp_ni,
+      v.resp_rate,
+      v.temperature,
+      v.spo2,
+      v.glucose,
+      -- Independent g-counter for each variable
+      COUNT(v.heart_rate) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g1,
+      COUNT(v.sbp) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g2,
+      COUNT(v.dbp) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g3,
+      COUNT(v.mbp) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g4,
+      COUNT(v.sbp_ni) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g5,
+      COUNT(v.dbp_ni) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g6,
+      COUNT(v.mbp_ni) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g7,
+      COUNT(v.resp_rate) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g8,
+      COUNT(v.temperature) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g9,
+      COUNT(v.spo2) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g10,
+      COUNT(v.glucose) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g11
+  FROM person_hourly_with_drugs b
+  LEFT JOIN vitalsign_with_hr v
+      ON b.stay_id = v.stay_id
+      AND b.hr = v.hr
+")
+
+cat("✓ Created g-counters\n")
+
+# Execute forward filling
+dbExecute(con, "
+  CREATE OR REPLACE TABLE vitalsign_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      -- Get MAX within each g-group (forward fill)
+      MAX(heart_rate) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS heart_rate,
+      MAX(sbp) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS sbp,
+      MAX(dbp) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS dbp,
+      MAX(mbp) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS mbp,
+      MAX(sbp_ni) OVER(PARTITION BY stay_id, g5 ORDER BY hr) AS sbp_ni,
+      MAX(dbp_ni) OVER(PARTITION BY stay_id, g6 ORDER BY hr) AS dbp_ni,
+      MAX(mbp_ni) OVER(PARTITION BY stay_id, g7 ORDER BY hr) AS mbp_ni,
+      MAX(resp_rate) OVER(PARTITION BY stay_id, g8 ORDER BY hr) AS resp_rate,
+      MAX(temperature) OVER(PARTITION BY stay_id, g9 ORDER BY hr) AS temperature,
+      MAX(spo2) OVER(PARTITION BY stay_id, g10 ORDER BY hr) AS spo2,
+      MAX(glucose) OVER(PARTITION BY stay_id, g11 ORDER BY hr) AS glucose
+  FROM vitalsign_with_groups
+")
+
+cat("✓ Forward filling complete\n")
+```
+
+
+
+## Step 12.4: Final Aggregation by Hour
+
+```{r step12-4-aggregate-per-hr}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 12.4: Final aggregation by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# 15_vital_signs.sql logic: MAX for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE vitalsign_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(heart_rate) AS heart_rate,
+      MAX(sbp) AS sbp,
+      MAX(dbp) AS dbp,
+      MAX(mbp) AS mbp,
+      MAX(sbp_ni) AS sbp_ni,
+      MAX(dbp_ni) AS dbp_ni,
+      MAX(mbp_ni) AS mbp_ni,
+      MAX(resp_rate) AS resp_rate,
+      MAX(temperature) AS temperature,
+      MAX(spo2) AS spo2,
+      MAX(glucose) AS glucose
+  FROM vitalsign_forward_filled
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Final aggregation by hour complete\n")
+
+```
+
+
+
+## Step 12.5: Join to Person-Hourly Data
+
+```{r step12-5-join-to-base}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 12.5: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join vital signs to person_hourly_with_drugs
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_vitals AS
+  SELECT
+      p.*,
+      v.heart_rate,
+      v.sbp,
+      v.dbp,
+      v.mbp,
+      v.sbp_ni,
+      v.dbp_ni,
+      v.mbp_ni,
+      v.resp_rate,
+      v.temperature,
+      v.spo2,
+      v.glucose
+  FROM person_hourly_with_drugs p
+  LEFT JOIN vitalsign_hourly v
+      ON p.stay_id = v.stay_id
+      AND p.hr = v.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_vitals\n")
+cat("  Added variables: heart_rate, sbp, dbp, mbp, sbp_ni, dbp_ni, mbp_ni,\n")
+cat("                   resp_rate, temperature, spo2, glucose (11 variables)\n")
+```
+
+## Step 13: Extract O2_flow Data
+
+### Purpose
+Extract O2 flow (oxygen flow rate) data from chartevents, create derived_oxygen_delivery table, convert to hourly units, and apply forward filling.
+
+### Variables to Extract (3 variables)
+1. o2_flow - Primary oxygen flow rate (itemid: 223834, 227582)
+2. o2_flow_additional - Additional oxygen flow rate (itemid: 227287)
+3. o2_flow_total - Total oxygen flow rate (o2_flow + o2_flow_additional)
+
+### Processing Approach
+1. Create derived_oxygen_delivery using oxygen_delivery.sql
+2. Convert to hourly units from ICU admission
+3. Apply forward filling using g-counter logic
+4. Join to person_hourly_with_vitals
+
+
+
+## Step 13.1: Create derived_oxygen_delivery Table
+
+```{r step13-1-create-derived-oxygen}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 13.1: Create derived_oxygen_delivery table\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Create derived_oxygen_delivery using oxygen_delivery.sql logic
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_oxygen_delivery AS
+  
+  WITH ce_stg1 AS (
+      SELECT
+          ce.subject_id,
+          ce.stay_id,
+          ce.charttime,
+          CASE
+              -- merge o2 flows into a single row
+              WHEN itemid IN (223834, 227582) THEN 223834
+              ELSE itemid 
+          END AS itemid,
+          value,
+          valuenum,
+          valueuom,
+          storetime
+      FROM icu_chartevents ce
+      WHERE ce.value IS NOT NULL
+          AND ce.itemid IN (
+              223834,  -- o2 flow
+              227582,  -- bipap o2 flow
+              227287   -- additional o2 flow
+          )
+  ),
+  
+  ce_stg2 AS (
+      SELECT
+          ce.subject_id,
+          ce.stay_id,
+          ce.charttime,
+          itemid,
+          value,
+          valuenum,
+          valueuom,
+          -- retain only 1 row per charttime
+          -- prioritizing the last documented value
+          ROW_NUMBER() OVER (
+              PARTITION BY subject_id, charttime, itemid 
+              ORDER BY storetime DESC
+          ) AS rn
+      FROM ce_stg1 ce
+  )
+  
+  SELECT
+      subject_id,
+      MAX(stay_id) AS stay_id,
+      charttime,
+      MAX(CASE WHEN itemid = 223834 THEN valuenum END) AS o2_flow,
+      MAX(CASE WHEN itemid = 227287 THEN valuenum END) AS o2_flow_additional
+  FROM ce_stg2
+  WHERE rn = 1
+  GROUP BY subject_id, charttime
+")
+
+cat("✓ Created derived_oxygen_delivery table\n")
+
+# Basic statistics
+oxygen_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      COUNT(o2_flow) as records_with_o2_flow,
+      COUNT(o2_flow_additional) as records_with_additional,
+      ROUND(AVG(o2_flow), 2) as mean_o2_flow,
+      ROUND(AVG(o2_flow_additional), 2) as mean_o2_flow_additional
+  FROM derived_oxygen_delivery
+")
+
+print("derived_oxygen_delivery basic statistics:")
+print(oxygen_stats)
+```
+
+
+
+## Step 13.2: Convert to Hourly Units
+
+```{r step13-2-convert-to-hr}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 13.2: Convert to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Convert to hourly units from ICU admission
+dbExecute(con, "
+  CREATE OR REPLACE TABLE oxygen_with_hr AS
+  SELECT
+      o.charttime,
+      o.o2_flow,
+      o.o2_flow_additional,
+      -- Total O2 flow
+      COALESCE(o.o2_flow, 0) + COALESCE(o.o2_flow_additional, 0) AS o2_flow_total,
+      icu.stay_id,
+      -- Hours elapsed from ICU admission (rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (o.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_oxygen_delivery o
+      ON icu.stay_id = o.stay_id
+  WHERE o.charttime >= icu.intime  -- Only after ICU admission
+")
+
+cat("✓ Conversion to hourly units completed\n")
+
+# Statistics after hr conversion
+hr_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_records,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      COUNT(o2_flow) as records_with_o2_flow,
+      COUNT(o2_flow_additional) as records_with_additional,
+      COUNT(CASE WHEN o2_flow_total > 0 THEN 1 END) as records_with_total,
+      MIN(hr) as min_hr,
+      MAX(hr) as max_hr
+  FROM oxygen_with_hr
+")
+
+print("Statistics after hr conversion:")
+print(hr_stats)
+```
+
+
+
+## Step 13.3: Forward Filling (g-counter Logic)
+
+```{r step13-3-forward-fill}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 13.3: Forward Filling (g-counter logic)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Independent g-counter for each variable
+dbExecute(con, "
+  CREATE OR REPLACE TABLE oxygen_with_groups AS
+  SELECT
+      b.stay_id, 
+      b.hr, 
+      o.charttime,
+      o.o2_flow,
+      o.o2_flow_additional,
+      o.o2_flow_total,
+      -- Independent g-counter for each variable
+      COUNT(o.o2_flow) OVER (
+          PARTITION BY b.stay_id ORDER BY b.hr
+      ) AS g1,
+      COUNT(o.o2_flow_additional) OVER (
+          PARTITION BY b.stay_id ORDER BY b.hr
+      ) AS g2,
+      COUNT(o.o2_flow_total) OVER (
+          PARTITION BY b.stay_id ORDER BY b.hr
+      ) AS g3
+  FROM person_hourly_with_vitals b
+  LEFT JOIN oxygen_with_hr o
+      ON b.stay_id = o.stay_id
+      AND b.hr = o.hr
+")
+
+cat("✓ Created g-counters\n")
+
+# Execute forward filling
+dbExecute(con, "
+  CREATE OR REPLACE TABLE oxygen_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      -- Get MAX within each g group (forward fill)
+      MAX(o2_flow) OVER(
+          PARTITION BY stay_id, g1 ORDER BY hr
+      ) AS o2_flow,
+      MAX(o2_flow_additional) OVER(
+          PARTITION BY stay_id, g2 ORDER BY hr
+      ) AS o2_flow_additional,
+      MAX(o2_flow_total) OVER(
+          PARTITION BY stay_id, g3 ORDER BY hr
+      ) AS o2_flow_total
+  FROM oxygen_with_groups
+")
+
+cat("✓ Forward filling completed\n")
+```
+
+
+
+## Step 13.4: Final Aggregation by Hour
+
+```{r step13-4-aggregate-per-hr}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 13.4: Final aggregation by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# MAX for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE oxygen_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(o2_flow) AS o2_flow,
+      MAX(o2_flow_additional) AS o2_flow_additional,
+      MAX(o2_flow_total) AS o2_flow_total
+  FROM oxygen_forward_filled
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Final hourly aggregation completed\n")
+
+# Statistics after forward filling
+filled_stats <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_hours,
+      COUNT(DISTINCT stay_id) as total_patients,
+      COUNT(o2_flow) as hours_with_o2_flow,
+      COUNT(o2_flow_additional) as hours_with_additional,
+      COUNT(o2_flow_total) as hours_with_total,
+      ROUND(COUNT(o2_flow) * 100.0 / COUNT(*), 2) as pct_o2_flow,
+      ROUND(COUNT(o2_flow_total) * 100.0 / COUNT(*), 2) as pct_total,
+      ROUND(AVG(o2_flow), 2) as mean_o2_flow,
+      ROUND(AVG(o2_flow_total), 2) as mean_o2_flow_total
+  FROM oxygen_hourly
+")
+
+print("Statistics after forward filling:")
+print(filled_stats)
+```
+
+
+
+## Step 13.5: Join to Person-hourly Data
+
+```{r step13-5-join-to-base}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 13.5: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join O2 flow to person_hourly_with_vitals
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_o2flow AS
+  SELECT
+      p.*,
+      o.o2_flow,
+      o.o2_flow_additional,
+      o.o2_flow_total
+  FROM person_hourly_with_vitals p
+  LEFT JOIN oxygen_hourly o
+      ON p.stay_id = o.stay_id
+      AND p.hr = o.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_o2flow\n")
+cat("  Added variables: o2_flow, o2_flow_additional, o2_flow_total (3 variables)\n")
+```
+
+
+
+## Step 14: Extract Arterial Blood Gas (ABG) Data
+
+### Purpose
+Extract arterial blood gas analysis data from derived_bg, convert to hourly units, and apply forward filling.
+
+### Variables to Extract (8 variables)
+1. ph - pH
+2. po2 - PaO2 (arterial oxygen partial pressure)
+3. pco2 - PaCO2 (arterial carbon dioxide partial pressure)
+4. fio2_abg - FiO2 (at blood gas measurement)
+5. pao2fio2ratio - P/F ratio
+6. lactate - Lactate
+7. baseexcess - Base excess
+8. bicarbonate - Bicarbonate
+
+### Processing Approach
+1. Extract only arterial blood (specimen='ART.') from derived_bg
+2. Convert to hourly units from ICU admission
+3. Apply forward filling with independent g-counter for each variable
+4. Join to person_hourly_with_o2flow
+
+
+
+## Step 14.1: Convert ABG to Hourly Units
+
+```{r step14-1-extract-abg}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.1: Convert arterial blood gas (ABG) to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract arterial blood gas from derived_bg and convert to hourly units
+dbExecute(con, "
+  CREATE OR REPLACE TABLE abg_with_hr AS
+  SELECT
+      bg.charttime,
+      bg.specimen,
+      bg.ph,
+      bg.po2,
+      bg.pco2,
+      bg.fio2,
+      bg.pao2fio2ratio,
+      bg.lactate,
+      bg.baseexcess,
+      bg.bicarbonate,
+      icu.stay_id,
+      -- Hours elapsed from ICU admission (rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (bg.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_bg bg
+      ON icu.hadm_id = bg.hadm_id
+  WHERE bg.charttime >= icu.intime  -- Only after ICU admission
+      AND bg.specimen = 'ART.'  -- Arterial blood only
+      AND icu.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+")
+
+cat("✓ Converted arterial blood gas to hourly units\n")
+
+
+```
+
+
+## Step 14.2: Forward Filling (g-counter Logic)
+
+```{r step14-2-forward-fill-abg}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.2: Forward Filling for ABG (g-counter)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Independent g-counter for each variable
+dbExecute(con, "
+  CREATE OR REPLACE TABLE abg_with_groups AS
+  SELECT
+      b.stay_id,
+      b.hr,
+      a.charttime,
+      a.ph,
+      a.po2,
+      a.pco2,
+      a.fio2,
+      a.pao2fio2ratio,
+      a.lactate,
+      a.baseexcess,
+      a.bicarbonate,
+      -- Independent g-counter for each variable
+      COUNT(a.ph) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g1,
+      COUNT(a.po2) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g2,
+      COUNT(a.pco2) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g3,
+      COUNT(a.fio2) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g4,
+      COUNT(a.pao2fio2ratio) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g5,
+      COUNT(a.lactate) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g6,
+      COUNT(a.baseexcess) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g7,
+      COUNT(a.bicarbonate) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g8
+  FROM person_hourly_with_o2flow b
+  LEFT JOIN abg_with_hr a
+      ON b.stay_id = a.stay_id
+      AND b.hr = a.hr
+")
+
+cat("✓ Created g-counters\n")
+
+# Execute forward filling
+dbExecute(con, "
+  CREATE OR REPLACE TABLE abg_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      -- Get MAX within each g group (forward fill)
+      MAX(ph) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS ph,
+      MAX(po2) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS po2,
+      MAX(pco2) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS pco2,
+      MAX(fio2) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS fio2_abg,
+      MAX(pao2fio2ratio) OVER(PARTITION BY stay_id, g5 ORDER BY hr) AS pao2fio2ratio,
+      MAX(lactate) OVER(PARTITION BY stay_id, g6 ORDER BY hr) AS lactate,
+      MAX(baseexcess) OVER(PARTITION BY stay_id, g7 ORDER BY hr) AS baseexcess,
+      MAX(bicarbonate) OVER(PARTITION BY stay_id, g8 ORDER BY hr) AS bicarbonate
+  FROM abg_with_groups
+")
+
+cat("✓ Forward filling completed\n")
+```
+
+
+
+## Step 14.3: Final Aggregation by Hour
+
+```{r step14-3-aggregate-abg}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.3: Final aggregation by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# MAX for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE abg_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(ph) AS ph,
+      MAX(po2) AS po2,
+      MAX(pco2) AS pco2,
+      MAX(fio2_abg) AS fio2_abg,
+      MAX(pao2fio2ratio) AS pao2fio2ratio,
+      MAX(lactate) AS lactate,
+      MAX(baseexcess) AS baseexcess,
+      MAX(bicarbonate) AS bicarbonate
+  FROM abg_forward_filled
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Final hourly aggregation completed\n")
+
+```
+
+
+
+## Step 14.4: Join to Person-hourly Data
+
+```{r step14-4-join-abg}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.4: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join arterial blood gas to person_hourly_with_o2flow
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_abg AS
+  SELECT
+      p.*,
+      a.ph,
+      a.po2,
+      a.pco2,
+      a.fio2_abg,
+      a.pao2fio2ratio,
+      a.lactate,
+      a.baseexcess,
+      a.bicarbonate
+  FROM person_hourly_with_o2flow p
+  LEFT JOIN abg_hourly a
+      ON p.stay_id = a.stay_id
+      AND p.hr = a.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_abg\n")
+cat("  Added variables: ph, po2, pco2, fio2_abg, pao2fio2ratio, lactate, baseexcess, bicarbonate (8 variables)\n")
+
+```
+
+
+## Step 14.6: Extract Chemistry Data (48-hour Forward Fill)
+
+### Purpose
+Extract chemistry lab data from derived_chemistry and apply **forward fill limited to 48 hours**.
+
+### Variables to Extract (6 variables)
+1. creatinine - Creatinine (renal function)
+2. sodium - Sodium
+3. potassium - Potassium
+4. chloride - Chloride
+5. bun - Blood urea nitrogen
+6. glucose - Blood glucose (from chemistry)
+
+### Processing Approach (forward fill with 48-hour limit)
+1. Convert derived_chemistry to hourly units (retain measurement time)
+2. Apply forward fill using g-counter
+3. Replace values with NULL if >48 hours have passed since last measurement
+4. Join to person_hourly_with_abg
+
+
+
+## Step 14.6.1: Convert Chemistry to Hourly Units
+
+```{r step14-6-1-extract-chemistry}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.6.1: Convert chemistry labs to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract derived_chemistry and convert to hourly units
+dbExecute(con, "
+  CREATE OR REPLACE TABLE chemistry_with_hr AS
+  SELECT
+      chem.charttime,
+      chem.creatinine,
+      chem.sodium,
+      chem.potassium,
+      chem.chloride,
+      chem.bun,
+      chem.glucose,
+      icu.stay_id,
+      -- Hours elapsed from ICU admission (rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (chem.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_chemistry chem
+      ON icu.hadm_id = chem.hadm_id
+  WHERE chem.charttime >= icu.intime  -- Only after ICU admission
+      AND icu.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+")
+
+cat("✓ Converted chemistry labs to hourly units\n")
+
+```
+
+
+
+## Step 14.6.2: Forward Filling (g-counter + Retain Measurement Time)
+
+```{r step14-6-2-forward-fill-chemistry}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.6.2: Forward filling for Chemistry (retain measurement time)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Independent g-counter for each variable (retain measurement time)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE chemistry_with_groups AS
+  SELECT
+      b.stay_id,
+      b.hr,
+      c.charttime,
+      c.creatinine,
+      c.sodium,
+      c.potassium,
+      c.chloride,
+      c.bun,
+      c.glucose,
+      -- Independent g-counter for each variable
+      COUNT(c.creatinine) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g1,
+      COUNT(c.sodium) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g2,
+      COUNT(c.potassium) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g3,
+      COUNT(c.chloride) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g4,
+      COUNT(c.bun) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g5,
+      COUNT(c.glucose) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g6
+  FROM person_hourly_with_abg b
+  LEFT JOIN chemistry_with_hr c
+      ON b.stay_id = c.stay_id
+      AND b.hr = c.hr
+")
+
+cat("✓ Created g-counters\n")
+
+# Execute forward filling (also retain measurement hr)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE chemistry_forward_filled_temp AS
+  SELECT
+      stay_id,
+      hr,
+      -- MAX within each g group (value and its measurement hr)
+      MAX(creatinine) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS creatinine,
+      MAX(CASE WHEN creatinine IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS creatinine_hr,
+
+      MAX(sodium) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS sodium,
+      MAX(CASE WHEN sodium IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS sodium_hr,
+
+      MAX(potassium) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS potassium,
+      MAX(CASE WHEN potassium IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS potassium_hr,
+
+      MAX(chloride) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS chloride,
+      MAX(CASE WHEN chloride IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS chloride_hr,
+
+      MAX(bun) OVER(PARTITION BY stay_id, g5 ORDER BY hr) AS bun,
+      MAX(CASE WHEN bun IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g5 ORDER BY hr) AS bun_hr,
+
+      MAX(glucose) OVER(PARTITION BY stay_id, g6 ORDER BY hr) AS glucose,
+      MAX(CASE WHEN glucose IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g6 ORDER BY hr) AS glucose_hr
+  FROM chemistry_with_groups
+")
+
+cat("✓ Forward filling (with measurement hr retention) completed\n")
+```
+
+
+
+## Step 14.6.3: Apply 48-hour Limit
+
+```{r step14-6-3-apply-48h-limit}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.6.3: Apply 48-hour limit\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Set values to NULL if >48 hours have passed since last measurement
+dbExecute(con, "
+  CREATE OR REPLACE TABLE chemistry_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      -- For each value: keep if within 48 hours of measurement, otherwise NULL
+      CASE WHEN hr - creatinine_hr <= 48 THEN creatinine ELSE NULL END AS creatinine,
+      CASE WHEN hr - sodium_hr <= 48 THEN sodium ELSE NULL END AS sodium,
+      CASE WHEN hr - potassium_hr <= 48 THEN potassium ELSE NULL END AS potassium,
+      CASE WHEN hr - chloride_hr <= 48 THEN chloride ELSE NULL END AS chloride,
+      CASE WHEN hr - bun_hr <= 48 THEN bun ELSE NULL END AS bun,
+      CASE WHEN hr - glucose_hr <= 48 THEN glucose ELSE NULL END AS glucose
+  FROM chemistry_forward_filled_temp
+")
+
+cat("✓ Applied 48-hour limit\n")
+
+
+```
+
+
+
+## Step 14.6.4: Final Aggregation by Hour
+
+```{r step14-6-4-aggregate-chemistry}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.6.4: Final aggregation by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# MAX for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE chemistry_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(creatinine) AS creatinine,
+      MAX(sodium) AS sodium,
+      MAX(potassium) AS potassium,
+      MAX(chloride) AS chloride,
+      MAX(bun) AS bun,
+      MAX(glucose) AS glucose_chem
+  FROM chemistry_forward_filled
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Final hourly aggregation completed\n")
+```
+
+
+
+## Step 14.6.5: Join to Person-hourly Data
+
+```{r step14-6-5-join-chemistry}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.6.5: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join chemistry labs to person_hourly_with_abg
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_labs AS
+  SELECT
+      p.*,
+      c.creatinine,
+      c.sodium,
+      c.potassium,
+      c.chloride,
+      c.bun,
+      c.glucose_chem
+  FROM person_hourly_with_abg p
+  LEFT JOIN chemistry_hourly c
+      ON p.stay_id = c.stay_id
+      AND p.hr = c.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_labs\n")
+cat("  Added variables: creatinine, sodium, potassium, chloride, bun, glucose_chem (6 variables)\n")
+
+```
+
+## Step 14.7: Extract CBC Data (48-hour Forward Fill)
+
+### Purpose
+Extract complete blood count data from derived_complete_blood_count and apply **forward fill limited to 48 hours**.
+
+### Variables to Extract (4 variables)
+1. wbc - White blood cell count
+2. hemoglobin - Hemoglobin
+3. hematocrit - Hematocrit
+4. platelet - Platelet count
+
+### Processing Approach (forward fill with 48-hour limit)
+1. Convert derived_complete_blood_count to hourly units (retain measurement time)
+2. Apply forward fill using g-counter
+3. Replace values with NULL if >48 hours have passed since last measurement
+4. Join to person_hourly_with_labs
+
+
+
+## Step 14.7.1: Convert CBC to Hourly Units
+
+```{r step14-7-1-extract-cbc}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.7.1: Convert complete blood count (CBC) to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract derived_complete_blood_count and convert to hourly units
+dbExecute(con, "
+  CREATE OR REPLACE TABLE cbc_with_hr AS
+  SELECT
+      cbc.charttime,
+      cbc.wbc,
+      cbc.hemoglobin,
+      cbc.hematocrit,
+      cbc.platelet,
+      icu.stay_id,
+      -- Hours elapsed from ICU admission (rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (cbc.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_complete_blood_count cbc
+      ON icu.hadm_id = cbc.hadm_id
+  WHERE cbc.charttime >= icu.intime  -- Only after ICU admission
+      AND icu.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+")
+
+cat("✓ Converted CBC to hourly units\n")
+
+```
+
+
+
+## Step 14.7.2: Forward Filling (g-counter + Retain Measurement Time)
+
+```{r step14-7-2-forward-fill-cbc}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.7.2: Forward filling for CBC (retain measurement time)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Independent g-counter for each variable (retain measurement time)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE cbc_with_groups AS
+  SELECT
+      b.stay_id,
+      b.hr,
+      c.charttime,
+      c.wbc,
+      c.hemoglobin,
+      c.hematocrit,
+      c.platelet,
+      -- Independent g-counter for each variable
+      COUNT(c.wbc) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g1,
+      COUNT(c.hemoglobin) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g2,
+      COUNT(c.hematocrit) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g3,
+      COUNT(c.platelet) OVER (PARTITION BY b.stay_id ORDER BY b.hr) AS g4
+  FROM person_hourly_with_labs b
+  LEFT JOIN cbc_with_hr c
+      ON b.stay_id = c.stay_id
+      AND b.hr = c.hr
+")
+
+cat("✓ Created g-counters\n")
+
+# Execute forward filling (also retain measurement hr)
+dbExecute(con, "
+  CREATE OR REPLACE TABLE cbc_forward_filled_temp AS
+  SELECT
+      stay_id,
+      hr,
+      -- MAX within each g group (value and its measurement hr)
+      MAX(wbc) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS wbc,
+      MAX(CASE WHEN wbc IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g1 ORDER BY hr) AS wbc_hr,
+
+      MAX(hemoglobin) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS hemoglobin,
+      MAX(CASE WHEN hemoglobin IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g2 ORDER BY hr) AS hemoglobin_hr,
+
+      MAX(hematocrit) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS hematocrit,
+      MAX(CASE WHEN hematocrit IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g3 ORDER BY hr) AS hematocrit_hr,
+
+      MAX(platelet) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS platelet,
+      MAX(CASE WHEN platelet IS NOT NULL THEN hr END) OVER(PARTITION BY stay_id, g4 ORDER BY hr) AS platelet_hr
+  FROM cbc_with_groups
+")
+
+cat("✓ Forward filling (with measurement hr retention) completed\n")
+```
+
+
+
+## Step 14.7.3: Apply 48-hour Limit
+
+```{r step14-7-3-apply-48h-limit}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.7.3: Apply 48-hour limit\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Set values to NULL if >48 hours have passed since last measurement
+dbExecute(con, "
+  CREATE OR REPLACE TABLE cbc_forward_filled AS
+  SELECT
+      stay_id,
+      hr,
+      -- For each value: keep if within 48 hours of measurement, otherwise NULL
+      CASE WHEN hr - wbc_hr <= 48 THEN wbc ELSE NULL END AS wbc,
+      CASE WHEN hr - hemoglobin_hr <= 48 THEN hemoglobin ELSE NULL END AS hemoglobin,
+      CASE WHEN hr - hematocrit_hr <= 48 THEN hematocrit ELSE NULL END AS hematocrit,
+      CASE WHEN hr - platelet_hr <= 48 THEN platelet ELSE NULL END AS platelet
+  FROM cbc_forward_filled_temp
+")
+
+cat("✓ Applied 48-hour limit\n")
+
+
+```
+
+
+
+## Step 14.7.4: Final Aggregation by Hour
+
+```{r step14-7-4-aggregate-cbc}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.7.4: Final aggregation by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# MAX for each hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE cbc_hourly AS
+  SELECT
+      stay_id,
+      hr,
+      MAX(wbc) AS wbc,
+      MAX(hemoglobin) AS hemoglobin,
+      MAX(hematocrit) AS hematocrit,
+      MAX(platelet) AS platelet
+  FROM cbc_forward_filled
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Final hourly aggregation completed\n")
+```
+
+
+
+## Step 14.7.5: Join to Person-hourly Data
+
+```{r step14-7-5-join-cbc}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 14.7.5: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join CBC to person_hourly_with_labs
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_cbc AS
+  SELECT
+      p.*,
+      c.wbc,
+      c.hemoglobin,
+      c.hematocrit,
+      c.platelet
+  FROM person_hourly_with_labs p
+  LEFT JOIN cbc_hourly c
+      ON p.stay_id = c.stay_id
+      AND p.hr = c.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_cbc\n")
+cat("  Added variables: wbc, hemoglobin, hematocrit, platelet (4 variables)\n")
+
+
+```
+
+
+
+
+## Step 15: Extract CRRT Data (Continuous Renal Replacement Therapy)
+
+### Purpose
+Extract CRRT implementation data from chartevents and record as binary variable (0/1).
+
+### Variables to Extract (1 variable)
+- rrt: CRRT implementation flag (0 = not implemented, 1 = in progress)
+
+### Target itemid (from 16_crrt.sql)
+- 224144: Blood Flow (ml/min)
+- 224191: Hourly Patient Fluid Removal
+
+### Processing Approach
+1. Extract 2 itemids from chartevents (valuenum > 0 only)
+2. Convert to hourly units
+3. rrt=1 if CRRT in progress during that hr
+4. No forward fill needed (1 only during implementation hours, 0 otherwise)
+5. Join to person_hourly_with_cbc
+
+
+
+## Step 15.1: Extract CRRT Data and Convert to Hourly Units
+
+```{r step15-1-extract-crrt}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 15.1: Convert CRRT data to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract CRRT-related data from chartevents and convert to hourly units
+dbExecute(con, "
+  CREATE OR REPLACE TABLE crrt_with_hr AS
+
+  WITH crrt_settings AS (
+      SELECT
+          ce.stay_id,
+          ce.charttime,
+          MIN(ce.itemid) as itemid,
+          MIN(ce.value) as value,
+          MIN(ce.valuenum) as valuenum,
+          MAX(
+              CASE
+                  WHEN ce.itemid IN (224144, 224191) THEN 1
+                  ELSE 0
+              END
+          ) AS rrt
+      FROM icu_chartevents ce
+      WHERE ce.value IS NOT NULL
+          AND ce.itemid IN (224144, 224191)
+          AND ce.valuenum IS NOT NULL
+          AND ce.valuenum > 0
+          AND ce.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+      GROUP BY ce.stay_id, ce.charttime, ce.value, ce.valuenum
+  )
+
+  SELECT
+      crrt_settings.stay_id,
+      crrt_settings.charttime,
+      crrt_settings.itemid,
+      crrt_settings.value,
+      crrt_settings.rrt,
+      -- Hours elapsed from ICU admission (rounded down)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (crrt_settings.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN crrt_settings
+      ON icu.stay_id = crrt_settings.stay_id
+  WHERE CAST(
+          FLOOR(EXTRACT(EPOCH FROM (crrt_settings.charttime - icu.intime)) / 3600) AS INTEGER
+      ) >= 0  -- Only after ICU admission
+")
+
+cat("✓ Converted CRRT data to hourly units\n")
+
+```
+
+
+
+## Step 15.2: Aggregate CRRT Flag by Hour
+
+```{r step15-2-aggregate-crrt}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 15.2: Aggregate CRRT flag by hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# CRRT=1 if implemented during that hr
+dbExecute(con, "
+  CREATE OR REPLACE TABLE crrt_hourly AS
+  SELECT DISTINCT
+      stay_id,
+      hr,
+      MAX(rrt) AS rrt  -- MAX if multiple records in same hr (1 takes priority)
+  FROM crrt_with_hr
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Hourly aggregation completed\n")
+
+
+```
+
+
+
+## Step 15.3: Join to Person-hourly Data
+
+```{r step15-3-join-crrt}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 15.3: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join CRRT flag to person_hourly_with_cbc
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_crrt AS
+  SELECT
+      p.*,
+      COALESCE(c.rrt, 0) AS rrt
+  FROM person_hourly_with_cbc p
+  LEFT JOIN crrt_hourly c
+      ON p.stay_id = c.stay_id
+      AND p.hr = c.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Created table person_hourly_with_crrt\n")
+cat("  Added variables: rrt (1 variable)\n")
+
+
+```
+
+
+## Step 16: Extract GCS (Glasgow Coma Scale) Data (24-hour Forward Fill)
+
+### Purpose
+Extract GCS data from derived_gcs and apply **forward fill limited to 24 hours** to add hourly GCS total score and each component (eye, verbal, motor).
+
+### Variables to Extract (4 variables)
+1. gcs - GCS total score (3-15 points)
+2. gcs_eyes - Eye opening response (1-4 points)
+3. gcs_verbal - Verbal response (1-5 points)
+4. gcs_motor - Motor response (1-6 points)
+
+### Processing Approach (forward fill with 24-hour limit)
+1. Join derived_gcs on hr basis
+2. Apply forward filling with independent g-counter for each variable
+3. Replace values with NULL if >24 hours have passed since last measurement
+4. Join to person_hourly_with_crrt
+
+
+## Step 16.1: Convert GCS to hourly units
+
+```{r step16-1-extract-gcs}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 16.1: Convert GCS to hourly units\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Extract derived_gcs and convert to hourly units
+dbExecute(con, "
+  CREATE OR REPLACE TABLE gcs_with_hr AS
+  SELECT
+      gcs.charttime,
+      gcs.gcs,
+      gcs.gcs_eyes,
+      gcs.gcs_verbal,
+      gcs.gcs_motor,
+      icu.stay_id,
+      -- Elapsed time since ICU admission (hours, truncated)
+      CAST(
+          FLOOR(EXTRACT(EPOCH FROM (gcs.charttime - icu.intime)) / 3600) AS INTEGER
+      ) AS hr
+  FROM icu_stays_base icu
+  INNER JOIN derived_gcs gcs
+      ON icu.stay_id = gcs.stay_id
+  WHERE gcs.charttime >= icu.intime  -- Only after ICU admission
+      AND icu.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+")
+
+cat("✓ GCS converted to hourly units completed\n")
+
+```
+
+
+## Step 16.2: Aggregate GCS per hour (retain measurement time)
+
+```{r step16-2-aggregate-gcs}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 16.2: Aggregate GCS per hour\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Use minimum value (worst value) for each hour, and retain measurement time
+dbExecute(con, "
+  CREATE OR REPLACE TABLE gcs_hourly_raw AS
+  SELECT 
+      stay_id,
+      hr,
+      MIN(gcs) AS gcs,
+      MIN(gcs_eyes) AS gcs_eyes,
+      MIN(gcs_verbal) AS gcs_verbal,
+      MIN(gcs_motor) AS gcs_motor,
+      MIN(charttime) AS charttime
+  FROM gcs_with_hr
+  GROUP BY stay_id, hr
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Hourly aggregation completed\n")
+
+```
+
+
+## Step 16.3: Forward filling (24-hour limit)
+
+```{r step16-3-forward-fill}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 16.3: Forward filling (24-hour limit)\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Forward fill with independent g counter for each variable
+dbExecute(con, "
+  CREATE OR REPLACE TABLE gcs_forward_filled AS
+  WITH base_hours AS (
+      SELECT DISTINCT stay_id, hr
+      FROM person_hourly_with_crrt
+  ),
+  gcs_with_all_hours AS (
+      SELECT 
+          b.stay_id,
+          b.hr,
+          g.gcs,
+          g.gcs_eyes,
+          g.gcs_verbal,
+          g.gcs_motor,
+          g.charttime
+      FROM base_hours b
+      LEFT JOIN gcs_hourly_raw g
+          ON b.stay_id = g.stay_id
+          AND b.hr = g.hr
+  ),
+  -- g counter for each variable
+  gcs_with_counters AS (
+      SELECT
+          *,
+          SUM(CASE WHEN gcs IS NOT NULL THEN 1 ELSE 0 END) 
+              OVER (PARTITION BY stay_id ORDER BY hr) AS g_gcs,
+          SUM(CASE WHEN gcs_eyes IS NOT NULL THEN 1 ELSE 0 END) 
+              OVER (PARTITION BY stay_id ORDER BY hr) AS g_eye,
+          SUM(CASE WHEN gcs_verbal IS NOT NULL THEN 1 ELSE 0 END) 
+              OVER (PARTITION BY stay_id ORDER BY hr) AS g_verbal,
+          SUM(CASE WHEN gcs_motor IS NOT NULL THEN 1 ELSE 0 END) 
+              OVER (PARTITION BY stay_id ORDER BY hr) AS g_motor
+      FROM gcs_with_all_hours
+  ),
+  -- Apply forward fill
+  filled AS (
+      SELECT
+          stay_id,
+          hr,
+          FIRST_VALUE(gcs IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_gcs ORDER BY hr) AS gcs,
+          FIRST_VALUE(gcs_eyes IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_eye ORDER BY hr) AS gcs_eyes,
+          FIRST_VALUE(gcs_verbal IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_verbal ORDER BY hr) AS gcs_verbal,
+          FIRST_VALUE(gcs_motor IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_motor ORDER BY hr) AS gcs_motor,
+          FIRST_VALUE(charttime IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_gcs ORDER BY hr) AS last_gcs_time,
+          FIRST_VALUE(charttime IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_eye ORDER BY hr) AS last_eye_time,
+          FIRST_VALUE(charttime IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_verbal ORDER BY hr) AS last_verbal_time,
+          FIRST_VALUE(charttime IGNORE NULLS) 
+              OVER (PARTITION BY stay_id, g_motor ORDER BY hr) AS last_motor_time
+      FROM gcs_with_counters
+  ),
+  -- Get intime from person_hourly_with_crrt and convert hr to timestamp
+  with_timestamps AS (
+      SELECT
+          f.*,
+          p.intime,
+          p.intime + CAST((f.hr * 3600) AS INTEGER) * INTERVAL '1' SECOND AS current_time
+      FROM filled f
+      INNER JOIN person_hourly_with_crrt p
+          ON f.stay_id = p.stay_id
+          AND f.hr = p.hr
+  )
+  -- Replace values with NULL if more than 24 hours have passed
+  SELECT
+      stay_id,
+      hr,
+      CASE 
+          WHEN last_gcs_time IS NOT NULL 
+              AND EXTRACT(EPOCH FROM (current_time - last_gcs_time)) / 3600 <= 24 
+          THEN gcs 
+          ELSE NULL 
+      END AS gcs,
+      CASE 
+          WHEN last_eye_time IS NOT NULL 
+              AND EXTRACT(EPOCH FROM (current_time - last_eye_time)) / 3600 <= 24 
+          THEN gcs_eyes 
+          ELSE NULL 
+      END AS gcs_eyes,
+      CASE 
+          WHEN last_verbal_time IS NOT NULL 
+              AND EXTRACT(EPOCH FROM (current_time - last_verbal_time)) / 3600 <= 24 
+          THEN gcs_verbal 
+          ELSE NULL 
+      END AS gcs_verbal,
+      CASE 
+          WHEN last_motor_time IS NOT NULL 
+              AND EXTRACT(EPOCH FROM (current_time - last_motor_time)) / 3600 <= 24 
+          THEN gcs_motor 
+          ELSE NULL 
+      END AS gcs_motor
+  FROM with_timestamps
+  ORDER BY stay_id, hr
+")
+
+cat("✓ Forward filling (24-hour limit) completed\n")
+
+```
+
+
+## Step 16.4: Join to person-hourly data
+
+```{r step16-4-join-gcs}
+cat("\n")
+cat("=", rep("=", 50), "\n", sep = "")
+cat("Step 16.4: Join to person_hourly data\n")
+cat("=", rep("=", 50), "\n", sep = "")
+
+# Join GCS to person_hourly_with_crrt
+dbExecute(con, "
+  CREATE OR REPLACE TABLE person_hourly_with_gcs AS
+  SELECT
+      p.*,
+      g.gcs,
+      g.gcs_eyes,
+      g.gcs_verbal,
+      g.gcs_motor
+  FROM person_hourly_with_crrt p
+  LEFT JOIN gcs_forward_filled g
+      ON p.stay_id = g.stay_id
+      AND p.hr = g.hr
+  ORDER BY p.stay_id, p.hr
+")
+
+cat("✓ Table person_hourly_with_gcs created\n")
+cat("  Added variables: gcs, gcs_eyes, gcs_verbal, gcs_motor (4 variables)\n")
+cat("  Forward filling: 24-hour limit\n")
+
+```
+
+
+
+## Step 17: Create Derived Tables Needed for SOFA and Sepsis-3
+
+### Purpose
+Create derived tables required for Sepsis-3 diagnosis and SOFA score calculation.
+
+### Dependency order
+1. ✅ derived_vitalsign (created in Step 12)
+2. derived_weight_durations
+3. derived_urine_output
+4. derived_urine_output_rate
+5. ✅ derived_ventilator_setting (partially obtained)
+6. derived_ventilation
+7. derived_suspicion_of_infection
+
+
+
+## Step 17.1: Create derived_weight_durations
+
+```{r step17-1-weight-durations}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 16.1: Create derived_weight_durations\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Convert weight_durations SQL for DuckDB
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_weight_durations AS
+  
+  WITH wt_stg AS (
+      SELECT
+          c.stay_id,
+          c.charttime,
+          CASE WHEN c.itemid = 226512 THEN 'admit'
+              ELSE 'daily' END AS weight_type,
+          c.valuenum AS weight
+      FROM icu_chartevents c
+      WHERE c.valuenum IS NOT NULL
+          AND c.itemid IN (226512, 224639)  -- Admit Wt, Daily Weight
+          AND c.valuenum > 0
+  ),
+  
+  wt_stg1 AS (
+      SELECT
+          stay_id,
+          charttime,
+          weight_type,
+          weight,
+          ROW_NUMBER() OVER (
+              PARTITION BY stay_id, weight_type ORDER BY charttime
+          ) AS rn
+      FROM wt_stg
+      WHERE weight IS NOT NULL
+  ),
+  
+  wt_stg2 AS (
+      SELECT
+          wt_stg1.stay_id,
+          ie.intime,
+          ie.outtime,
+          wt_stg1.weight_type,
+          CASE 
+              WHEN wt_stg1.weight_type = 'admit' AND wt_stg1.rn = 1
+              THEN intime - INTERVAL '2 hours'
+              ELSE wt_stg1.charttime 
+          END AS starttime,
+          wt_stg1.weight
+      FROM wt_stg1
+      INNER JOIN icu_icustays ie ON ie.stay_id = wt_stg1.stay_id
+  ),
+  
+  wt_stg3 AS (
+      SELECT
+          stay_id,
+          intime,
+          outtime,
+          starttime,
+          COALESCE(
+              LEAD(starttime) OVER (PARTITION BY stay_id ORDER BY starttime),
+              outtime + INTERVAL '2 hours'
+          ) AS endtime,
+          weight,
+          weight_type
+      FROM wt_stg2
+  ),
+  
+  wt1 AS (
+      SELECT
+          stay_id,
+          starttime,
+          COALESCE(
+              endtime,
+              LEAD(starttime) OVER (PARTITION BY stay_id ORDER BY starttime),
+              outtime + INTERVAL '2 hours'
+          ) AS endtime,
+          weight,
+          weight_type
+      FROM wt_stg3
+  ),
+  
+  wt_fix AS (
+      SELECT 
+          ie.stay_id,
+          ie.intime - INTERVAL '2 hours' AS starttime,
+          wt.starttime AS endtime,
+          wt.weight,
+          wt.weight_type
+      FROM icu_icustays ie
+      INNER JOIN (
+          SELECT 
+              wt1.stay_id,
+              wt1.starttime,
+              wt1.weight,
+              wt1.weight_type,
+              ROW_NUMBER() OVER (PARTITION BY wt1.stay_id ORDER BY wt1.starttime) AS rn
+          FROM wt1
+      ) wt ON ie.stay_id = wt.stay_id
+          AND wt.rn = 1
+          AND ie.intime < wt.starttime
+  )
+  
+  SELECT stay_id, starttime, endtime, weight, weight_type FROM wt1
+  UNION ALL
+  SELECT stay_id, starttime, endtime, weight, weight_type FROM wt_fix
+")
+
+cat("✓ derived_weight_durations created\n")
+
+
+```
+
+
+
+## Step 17.2: Create derived_urine_output
+
+```{r step17-2-urine-output}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 16.2: Create derived_urine_output\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Convert urine_output SQL for DuckDB
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_urine_output AS
+  
+  WITH uo AS (
+      SELECT
+          oe.stay_id,
+          oe.charttime,
+          CASE
+              WHEN oe.itemid = 227488 AND oe.value > 0 
+              THEN -1 * oe.value
+              ELSE oe.value
+          END AS urineoutput
+      FROM icu_outputevents oe
+      WHERE itemid IN (
+          226559, 226560, 226561, 226584, 226563, 226564, 226565,
+          226567, 226557, 226558, 227488, 227489
+      )
+  )
+  
+  SELECT
+      stay_id,
+      charttime,
+      SUM(urineoutput) AS urineoutput
+  FROM uo
+  GROUP BY stay_id, charttime
+")
+
+cat("✓ derived_urine_output created\n")
+
+
+```
+
+
+
+## Step 17.3: Create derived_urine_output_rate
+
+```{r step17-3-urine-output-rate}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 16.3: Create derived_urine_output_rate\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Convert urine_output_rate SQL for DuckDB
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_urine_output_rate AS
+  
+  WITH tm AS (
+      SELECT 
+          ie.stay_id,
+          MIN(ce.charttime) AS intime_hr,
+          MAX(ce.charttime) AS outtime_hr
+      FROM icu_icustays ie
+      INNER JOIN icu_chartevents ce
+          ON ie.stay_id = ce.stay_id
+          AND ce.itemid = 220045  -- Heart Rate
+          AND ce.charttime > ie.intime - INTERVAL '1 month'
+          AND ce.charttime < ie.outtime + INTERVAL '1 month'
+      GROUP BY ie.stay_id
+  ),
+  
+  uo_tm AS (
+      SELECT 
+          tm.stay_id,
+          CASE
+              WHEN LAG(uo.charttime) OVER w IS NULL
+              THEN CAST(EXTRACT(EPOCH FROM (uo.charttime - tm.intime_hr)) / 60 AS INTEGER)
+              ELSE CAST(EXTRACT(EPOCH FROM (uo.charttime - LAG(uo.charttime) OVER w)) / 60 AS INTEGER)
+          END AS tm_since_last_uo,
+          uo.charttime,
+          uo.urineoutput
+      FROM tm
+      INNER JOIN derived_urine_output uo ON tm.stay_id = uo.stay_id
+      WINDOW w AS (PARTITION BY tm.stay_id ORDER BY uo.charttime)
+  ),
+  
+  ur_stg AS (
+      SELECT 
+          io.stay_id,
+          io.charttime,
+          SUM(DISTINCT io.urineoutput) AS uo,
+          SUM(CASE 
+              WHEN CAST(EXTRACT(EPOCH FROM (io.charttime - iosum.charttime)) / 3600 AS INTEGER) <= 5
+              THEN iosum.urineoutput 
+          END) AS urineoutput_6hr,
+          SUM(CASE 
+              WHEN CAST(EXTRACT(EPOCH FROM (io.charttime - iosum.charttime)) / 3600 AS INTEGER) <= 5
+              THEN iosum.tm_since_last_uo 
+          END) / 60.0 AS uo_tm_6hr,
+          SUM(CASE 
+              WHEN CAST(EXTRACT(EPOCH FROM (io.charttime - iosum.charttime)) / 3600 AS INTEGER) <= 11
+              THEN iosum.urineoutput 
+          END) AS urineoutput_12hr,
+          SUM(CASE 
+              WHEN CAST(EXTRACT(EPOCH FROM (io.charttime - iosum.charttime)) / 3600 AS INTEGER) <= 11
+              THEN iosum.tm_since_last_uo 
+          END) / 60.0 AS uo_tm_12hr,
+          SUM(iosum.urineoutput) AS urineoutput_24hr,
+          SUM(iosum.tm_since_last_uo) / 60.0 AS uo_tm_24hr
+      FROM uo_tm io
+      LEFT JOIN uo_tm iosum
+          ON io.stay_id = iosum.stay_id
+          AND io.charttime >= iosum.charttime
+          AND io.charttime <= iosum.charttime + INTERVAL '23 hours'
+      GROUP BY io.stay_id, io.charttime
+  )
+  
+  SELECT
+      ur.stay_id,
+      ur.charttime,
+      wd.weight,
+      ur.uo,
+      ur.urineoutput_6hr,
+      ur.urineoutput_12hr,
+      ur.urineoutput_24hr,
+      CASE
+          WHEN ur.uo_tm_6hr >= 6 
+          THEN ROUND(CAST((ur.urineoutput_6hr / wd.weight / ur.uo_tm_6hr) AS NUMERIC), 4)
+      END AS uo_mlkghr_6hr,
+      CASE
+          WHEN ur.uo_tm_12hr >= 12 
+          THEN ROUND(CAST((ur.urineoutput_12hr / wd.weight / ur.uo_tm_12hr) AS NUMERIC), 4)
+      END AS uo_mlkghr_12hr,
+      CASE
+          WHEN ur.uo_tm_24hr >= 24 
+          THEN ROUND(CAST((ur.urineoutput_24hr / wd.weight / ur.uo_tm_24hr) AS NUMERIC), 4)
+      END AS uo_mlkghr_24hr,
+      ROUND(CAST(ur.uo_tm_6hr AS NUMERIC), 2) AS uo_tm_6hr,
+      ROUND(CAST(ur.uo_tm_12hr AS NUMERIC), 2) AS uo_tm_12hr,
+      ROUND(CAST(ur.uo_tm_24hr AS NUMERIC), 2) AS uo_tm_24hr
+  FROM ur_stg ur
+  LEFT JOIN derived_weight_durations wd
+      ON ur.stay_id = wd.stay_id
+      AND ur.charttime > wd.starttime
+      AND ur.charttime <= wd.endtime
+      AND wd.weight > 0
+")
+
+cat("✓ derived_urine_output_rate created\n")
+
+
+```
+
+
+
+## Step 17.4: Create derived_ventilator_setting
+
+```{r step17-4-ventilator-setting}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 16.4: Create derived_ventilator_setting\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Convert ventilator_setting SQL for DuckDB
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_ventilator_setting AS
+  
+  WITH ce AS (
+      SELECT
+          ce.subject_id,
+          ce.stay_id,
+          ce.charttime,
+          ce.itemid,
+          ce.value,
+          CASE
+              WHEN ce.itemid = 223835 THEN
+                  CASE
+                      WHEN ce.valuenum >= 0.20 AND ce.valuenum <= 1
+                      THEN ce.valuenum * 100
+                      WHEN ce.valuenum > 1 AND ce.valuenum < 20
+                      THEN NULL
+                      WHEN ce.valuenum >= 20 AND ce.valuenum <= 100
+                      THEN ce.valuenum
+                      ELSE NULL
+                  END
+              WHEN ce.itemid IN (220339, 224700) THEN
+                  CASE
+                      WHEN ce.valuenum > 100 THEN NULL
+                      WHEN ce.valuenum < 0 THEN NULL
+                      ELSE ce.valuenum
+                  END
+              ELSE ce.valuenum
+          END AS valuenum,
+          ce.valueuom,
+          ce.storetime
+      FROM icu_chartevents ce
+      WHERE ce.value IS NOT NULL
+          AND ce.stay_id IS NOT NULL
+          AND ce.itemid IN (
+              224688, 224689, 224690, 224687, 224685, 224684, 224686,
+              224696, 220339, 224700, 223835, 223849, 229314, 223848, 224691
+          )
+  )
+  
+  SELECT
+      subject_id,
+      MAX(stay_id) AS stay_id,
+      charttime,
+      MAX(CASE WHEN itemid = 224688 THEN valuenum END) AS respiratory_rate_set,
+      MAX(CASE WHEN itemid = 224690 THEN valuenum END) AS respiratory_rate_total,
+      MAX(CASE WHEN itemid = 224689 THEN valuenum END) AS respiratory_rate_spontaneous,
+      MAX(CASE WHEN itemid = 224687 THEN valuenum END) AS minute_volume,
+      MAX(CASE WHEN itemid = 224684 THEN valuenum END) AS tidal_volume_set,
+      MAX(CASE WHEN itemid = 224685 THEN valuenum END) AS tidal_volume_observed,
+      MAX(CASE WHEN itemid = 224686 THEN valuenum END) AS tidal_volume_spontaneous,
+      MAX(CASE WHEN itemid = 224696 THEN valuenum END) AS plateau_pressure,
+      MAX(CASE WHEN itemid IN (220339, 224700) THEN valuenum END) AS peep,
+      MAX(CASE WHEN itemid = 223835 THEN valuenum END) AS fio2,
+      MAX(CASE WHEN itemid = 224691 THEN valuenum END) AS flow_rate,
+      MAX(CASE WHEN itemid = 223849 THEN value END) AS ventilator_mode,
+      MAX(CASE WHEN itemid = 229314 THEN value END) AS ventilator_mode_hamilton,
+      MAX(CASE WHEN itemid = 223848 THEN value END) AS ventilator_type
+  FROM ce
+  GROUP BY subject_id, charttime
+")
+
+cat("✓ derived_ventilator_setting created\n")
+
+
+```
+
+
+
+## Step 17.6: Create derived_ventilation
+
+```{r step16-6-ventilation}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 17.6: Create derived_ventilation\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Note: ventilation.sql is complex, creating simplified version
+# Reuse invasive_noninvasive_highflow created in Step 9
+
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_ventilation AS
+  SELECT
+      stay_id,
+      starttime,
+      endtime,
+      CASE 
+          WHEN ventilation_status = 'Invasive' THEN 'InvasiveVent'
+          WHEN ventilation_status = 'Noninvasive' THEN 'NonInvasiveVent'
+          WHEN ventilation_status = 'HighFlow' THEN 'HFNC'
+          ELSE 'SupplementalOxygen'
+      END AS ventilation_status
+  FROM invasive_noninvasive_highflow
+  ORDER BY stay_id, starttime
+")
+
+cat("✓ derived_ventilation created\n")
+cat("  Note: Simplified version created from invasive_noninvasive_highflow\n")
+
+
+```
+
+
+
+## Step 18: Create derived_suspicion_of_infection
+
+### Purpose
+Determine "suspected infection" based on temporal relationship between antibiotic administration and microbiological culture.
+
+### Determination logic
+1. **Culture → Antibiotic**: Antibiotic given within 72 hours after culture
+2. **Antibiotic → Culture**: Culture taken within 24 hours before antibiotic
+3. If either criterion is met, suspected_infection = 1
+
+### Prerequisites
+- derived_antibiotic table must exist
+- hosp_microbiologyevents table must exist
+
+
+
+```{r step18-1-create-suspicion-infection}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 17.1: Create derived_suspicion_of_infection\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+cat("[IMPORTANT] Processing limited to HFNC cohort only\n\n")
+
+# Step 1: Prepare antibiotic data for HFNC cohort
+cat("Step 1/5: Preparing antibiotic data...\n")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_ab_tbl AS
+  SELECT
+      abx.subject_id, 
+      abx.hadm_id, 
+      abx.stay_id,
+      abx.antibiotic,
+      abx.starttime AS antibiotic_time,
+      DATE_TRUNC('day', abx.starttime) AS antibiotic_date,
+      abx.stoptime AS antibiotic_stoptime,
+      ROW_NUMBER() OVER (
+          PARTITION BY subject_id
+          ORDER BY starttime, stoptime, antibiotic
+      ) AS ab_id
+  FROM derived_antibiotic abx
+  WHERE abx.stay_id IN (SELECT stay_id FROM hfnc_cohort_final)
+")
+cat("  ✓ Completed\n")
+```
+
+
+```{r step18-1-create-suspicion-infection-2}
+# Step 2: Prepare microbiology test data
+cat("Step 2/5: Preparing microbiology test data...\n")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_me AS
+  SELECT 
+      micro_specimen_id,
+      MAX(subject_id) AS subject_id,
+      MAX(hadm_id) AS hadm_id,
+      CAST(MAX(chartdate) AS DATE) AS chartdate,
+      MAX(charttime) AS charttime,
+      MAX(spec_type_desc) AS spec_type_desc,
+      MAX(
+          CASE 
+              WHEN org_name IS NOT NULL
+                  AND org_itemid != 90856
+                  AND org_name != ''
+              THEN 1 
+              ELSE 0
+          END
+      ) AS positiveculture
+  FROM hosp_microbiologyevents
+  WHERE subject_id IN (SELECT DISTINCT subject_id FROM temp_ab_tbl)
+  GROUP BY micro_specimen_id
+")
+cat("  ✓ Completed\n")
+```
+
+
+```{r step18-1-create-suspicion-infection-3}
+# Step 3: Antibiotics within 72 hours after culture
+cat("Step 3/5: Matching Culture→Antibiotic...\n")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_me_then_ab AS
+  SELECT
+      ab_tbl.subject_id,
+      ab_tbl.hadm_id,
+      ab_tbl.stay_id,
+      ab_tbl.ab_id,
+      me72.micro_specimen_id,
+      COALESCE(me72.charttime, CAST(me72.chartdate AS TIMESTAMP)) AS last72_charttime,
+      me72.positiveculture AS last72_positiveculture,
+      me72.spec_type_desc AS last72_specimen,
+      ROW_NUMBER() OVER (
+          PARTITION BY ab_tbl.subject_id, ab_tbl.ab_id
+          ORDER BY me72.chartdate, me72.charttime NULLS LAST
+      ) AS micro_seq
+  FROM temp_ab_tbl ab_tbl
+  LEFT JOIN temp_me me72
+      ON ab_tbl.subject_id = me72.subject_id
+      AND (
+          (
+              me72.charttime IS NOT NULL
+              AND ab_tbl.antibiotic_time > me72.charttime
+              AND ab_tbl.antibiotic_time <= me72.charttime + INTERVAL '72 hours'
+          )
+          OR
+          (
+              me72.charttime IS NULL
+              AND ab_tbl.antibiotic_date >= me72.chartdate
+              AND ab_tbl.antibiotic_date <= me72.chartdate + INTERVAL '3 days'
+          )
+      )
+")
+cat("  ✓ Completed\n")
+```
+
+
+```{r step18-1-create-suspicion-infection-4}
+# Step 4: Culture within 24 hours before antibiotic
+cat("Step 4/5: Matching Antibiotic→Culture...\n")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE temp_ab_then_me AS
+  SELECT
+      ab_tbl.subject_id,
+      ab_tbl.hadm_id,
+      ab_tbl.stay_id,
+      ab_tbl.ab_id,
+      me24.micro_specimen_id,
+      COALESCE(me24.charttime, CAST(me24.chartdate AS TIMESTAMP)) AS next24_charttime,
+      me24.positiveculture AS next24_positiveculture,
+      me24.spec_type_desc AS next24_specimen,
+      ROW_NUMBER() OVER (
+          PARTITION BY ab_tbl.subject_id, ab_tbl.ab_id
+          ORDER BY me24.chartdate, me24.charttime NULLS LAST
+      ) AS micro_seq
+  FROM temp_ab_tbl ab_tbl
+  LEFT JOIN temp_me me24
+      ON ab_tbl.subject_id = me24.subject_id
+      AND (
+          (
+              me24.charttime IS NOT NULL
+              AND ab_tbl.antibiotic_time >= me24.charttime - INTERVAL '24 hours'
+              AND ab_tbl.antibiotic_time < me24.charttime
+          )
+          OR
+          (
+              me24.charttime IS NULL
+              AND ab_tbl.antibiotic_date >= me24.chartdate - INTERVAL '1 day'
+              AND ab_tbl.antibiotic_date <= me24.chartdate
+          )
+      )
+")
+cat("  ✓ Completed\n")
+```
+
+
+```{r step18-1-create-suspicion-infection-5}
+# Step 5: Final join
+cat("Step 5/5: Creating final table...\n")
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derived_suspicion_of_infection AS
+  SELECT
+      ab_tbl.subject_id,
+      ab_tbl.stay_id,
+      ab_tbl.hadm_id,
+      ab_tbl.ab_id,
+      ab_tbl.antibiotic,
+      ab_tbl.antibiotic_time,
+      
+      CASE
+          WHEN me2ab.last72_specimen IS NULL AND ab2me.next24_specimen IS NULL
+          THEN 0
+          ELSE 1
+      END AS suspected_infection,
+      
+      CASE
+          WHEN me2ab.last72_specimen IS NULL AND ab2me.next24_specimen IS NULL
+          THEN NULL
+          ELSE COALESCE(me2ab.last72_charttime, ab_tbl.antibiotic_time)
+      END AS suspected_infection_time,
+      
+      COALESCE(me2ab.last72_charttime, ab2me.next24_charttime) AS culture_time,
+      COALESCE(me2ab.last72_specimen, ab2me.next24_specimen) AS specimen,
+      COALESCE(me2ab.last72_positiveculture, ab2me.next24_positiveculture) AS positive_culture
+      
+  FROM temp_ab_tbl ab_tbl
+  LEFT JOIN temp_ab_then_me ab2me
+      ON ab_tbl.subject_id = ab2me.subject_id
+      AND ab_tbl.ab_id = ab2me.ab_id
+      AND ab2me.micro_seq = 1
+  LEFT JOIN temp_me_then_ab me2ab
+      ON ab_tbl.subject_id = me2ab.subject_id
+      AND ab_tbl.ab_id = me2ab.ab_id
+      AND me2ab.micro_seq = 1
+  ORDER BY ab_tbl.subject_id, ab_tbl.antibiotic_time
+")
+cat("  ✓ Completed\n")
+
+# Drop temporary tables
+cat("\nCleaning up temporary tables...\n")
+dbExecute(con, "DROP TABLE IF EXISTS temp_ab_tbl")
+dbExecute(con, "DROP TABLE IF EXISTS temp_me")
+dbExecute(con, "DROP TABLE IF EXISTS temp_me_then_ab")
+dbExecute(con, "DROP TABLE IF EXISTS temp_ab_then_me")
+cat("  ✓ Completed\n")
+
+cat("\n✓ derived_suspicion_of_infection created\n")
+```
+
+
+## Step 19: Create derive_sofa
+
+### Purpose
+Calculate Sequential Organ Failure Assessment (SOFA) score to quantify the degree of organ dysfunction across 6 organ systems. The SOFA score is used for Sepsis-3 diagnosis and mortality risk assessment.
+
+### SOFA Score Components (6 organ systems)
+1. **Respiration** - PaO2/FiO2 ratio (0-4 points)
+2. **Coagulation** - Platelet count (0-4 points)
+3. **Liver** - Bilirubin level (0-4 points)
+4. **Cardiovascular** - Mean arterial pressure and vasopressor use (0-4 points)
+5. **CNS (Central Nervous System)** - Glasgow Coma Scale (0-4 points)
+6. **Renal** - Creatinine or urine output (0-4 points)
+
+### Processing Approach
+1. Calculate component scores for each hour based on lab values and vital signs
+2. Apply 24-hour rolling window to capture worst values
+3. Generate total SOFA score (sum of 6 components, range 0-24)
+4. Use project-specific base table (person_hourly_with_crrt) and ventilation data
+
+### Prerequisites
+- person_hourly_with_crrt (base table)
+- invasive_noninvasive_highflow (for ventilation determination)
+- icu_stays_base (ICU admission time)
+- derived_* tables (bg, vitalsign, gcs, enzyme, chemistry, complete_blood_count, urine_output_rate)
+- derived_epinephrine, derived_norepinephrine, derived_dopamine, derived_dobutamine
+
+
+
+```{r step18-create-sofa-custom}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 19: Create derive_sofa (project custom version)\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+cat("\n[Note] This query is tailored to your project structure\n")
+cat("Base table: person_hourly_with_crrt\n")
+cat("Ventilation determination: invasive_noninvasive_highflow\n\n")
+
+# SOFA score calculation
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derive_sofa AS
+
+  -- Step 1: Base information for each hour (using person_hourly_with_crrt)
+  WITH co AS (
+      SELECT 
+          p.subject_id,
+          p.hadm_id,
+          p.stay_id,
+          p.hr,
+          -- starttime: intime + (hr-1) hours
+          i.intime + CAST(((p.hr - 1) * 3600) AS INTEGER) * INTERVAL '1' SECOND AS starttime,
+          -- endtime: intime + hr hours
+          i.intime + CAST((p.hr * 3600) AS INTEGER) * INTERVAL '1' SECOND AS endtime
+      FROM person_hourly_with_crrt p
+      LEFT JOIN icu_stays_base i
+          ON p.stay_id = i.stay_id
+      WHERE p.hr >= 0
+  )
+
+  -- Step 2: PaO2/FiO2 ratio (separated by presence of mechanical ventilation)
+  , pafi AS (
+      SELECT
+          ie.stay_id,
+          bg.charttime,
+          -- No mechanical ventilation (determined by invasive_noninvasive_highflow)
+          CASE
+              WHEN vd.stay_id IS NULL THEN bg.pao2fio2ratio
+              ELSE NULL
+          END AS pao2fio2ratio_novent,
+          -- Invasive mechanical ventilation present
+          CASE
+              WHEN vd.stay_id IS NOT NULL THEN bg.pao2fio2ratio
+              ELSE NULL
+          END AS pao2fio2ratio_vent
+      FROM icu_icustays ie
+      INNER JOIN derived_bg bg
+          ON ie.subject_id = bg.subject_id
+      LEFT JOIN invasive_noninvasive_highflow vd
+          ON ie.stay_id = vd.stay_id
+          AND bg.charttime >= vd.starttime
+          AND bg.charttime <= vd.endtime
+          AND vd.ventilation_status = 'Invasive'
+      WHERE bg.specimen = 'ART.'
+  )
+
+  -- Step 3: Vital signs (mean blood pressure)
+  , vs AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MIN(vs.mbp) AS meanbp_min
+      FROM co
+      LEFT JOIN derived_vitalsign vs
+          ON co.stay_id = vs.stay_id
+          AND co.starttime < vs.charttime
+          AND co.endtime >= vs.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 4: GCS
+  , gcs AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MIN(gcs.gcs) AS gcs_min
+      FROM co
+      LEFT JOIN derived_gcs gcs
+          ON co.stay_id = gcs.stay_id
+          AND co.starttime < gcs.charttime
+          AND co.endtime >= gcs.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 5: Bilirubin
+  , bili AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MAX(enz.bilirubin_total) AS bilirubin_max
+      FROM co
+      LEFT JOIN derived_enzyme enz
+          ON co.hadm_id = enz.hadm_id
+          AND co.starttime < enz.charttime
+          AND co.endtime >= enz.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 6: Creatinine
+  , cr AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MAX(chem.creatinine) AS creatinine_max
+      FROM co
+      LEFT JOIN derived_chemistry chem
+          ON co.hadm_id = chem.hadm_id
+          AND co.starttime < chem.charttime
+          AND co.endtime >= chem.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 7: Platelet
+  , plt AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MIN(cbc.platelet) AS platelet_min
+      FROM co
+      LEFT JOIN derived_complete_blood_count cbc
+          ON co.hadm_id = cbc.hadm_id
+          AND co.starttime < cbc.charttime
+          AND co.endtime >= cbc.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 8: P/F ratio aggregation
+  , pf AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MIN(pafi.pao2fio2ratio_novent) AS pao2fio2ratio_novent,
+          MIN(pafi.pao2fio2ratio_vent) AS pao2fio2ratio_vent
+      FROM co
+      LEFT JOIN pafi
+          ON co.stay_id = pafi.stay_id
+          AND co.starttime < pafi.charttime
+          AND co.endtime >= pafi.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 9: Urine output (24 hours)
+  , uo AS (
+      SELECT 
+          co.stay_id, 
+          co.hr,
+          MAX(
+              CASE 
+                  WHEN uo.uo_tm_24hr >= 22 AND uo.uo_tm_24hr <= 30
+                  THEN uo.urineoutput_24hr / uo.uo_tm_24hr * 24
+              END
+          ) AS uo_24hr
+      FROM co
+      LEFT JOIN derived_urine_output_rate uo
+          ON co.stay_id = uo.stay_id
+          AND co.starttime < uo.charttime
+          AND co.endtime >= uo.charttime
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 10: Vasopressors
+  , vaso AS (
+      SELECT
+          co.stay_id,
+          co.hr,
+          MAX(epi.vaso_rate) AS rate_epinephrine,
+          MAX(nor.vaso_rate) AS rate_norepinephrine,
+          MAX(dop.vaso_rate) AS rate_dopamine,
+          MAX(dob.vaso_rate) AS rate_dobutamine
+      FROM co
+      LEFT JOIN derived_epinephrine epi
+          ON co.stay_id = epi.stay_id
+          AND co.endtime > epi.starttime
+          AND co.endtime <= epi.endtime
+      LEFT JOIN derived_norepinephrine nor
+          ON co.stay_id = nor.stay_id
+          AND co.endtime > nor.starttime
+          AND co.endtime <= nor.endtime
+      LEFT JOIN derived_dopamine dop
+          ON co.stay_id = dop.stay_id
+          AND co.endtime > dop.starttime
+          AND co.endtime <= dop.endtime
+      LEFT JOIN derived_dobutamine dob
+          ON co.stay_id = dob.stay_id
+          AND co.endtime > dob.starttime
+          AND co.endtime <= dob.endtime
+      WHERE epi.stay_id IS NOT NULL
+          OR nor.stay_id IS NOT NULL
+          OR dop.stay_id IS NOT NULL
+          OR dob.stay_id IS NOT NULL
+      GROUP BY co.stay_id, co.hr
+  )
+
+  -- Step 11: Join all data
+  , scorecomp AS (
+      SELECT
+          co.stay_id,
+          co.hr,
+          co.starttime, 
+          co.endtime,
+          pf.pao2fio2ratio_novent,
+          pf.pao2fio2ratio_vent,
+          vaso.rate_epinephrine,
+          vaso.rate_norepinephrine,
+          vaso.rate_dopamine,
+          vaso.rate_dobutamine,
+          vs.meanbp_min,
+          gcs.gcs_min,
+          uo.uo_24hr,
+          bili.bilirubin_max,
+          cr.creatinine_max,
+          plt.platelet_min
+      FROM co
+      LEFT JOIN vs
+          ON co.stay_id = vs.stay_id AND co.hr = vs.hr
+      LEFT JOIN gcs
+          ON co.stay_id = gcs.stay_id AND co.hr = gcs.hr
+      LEFT JOIN bili
+          ON co.stay_id = bili.stay_id AND co.hr = bili.hr
+      LEFT JOIN cr
+          ON co.stay_id = cr.stay_id AND co.hr = cr.hr
+      LEFT JOIN plt
+          ON co.stay_id = plt.stay_id AND co.hr = plt.hr
+      LEFT JOIN pf
+          ON co.stay_id = pf.stay_id AND co.hr = pf.hr
+      LEFT JOIN uo
+          ON co.stay_id = uo.stay_id AND co.hr = uo.hr
+      LEFT JOIN vaso
+          ON co.stay_id = vaso.stay_id AND co.hr = vaso.hr
+  )
+
+  -- Step 12: Calculate each component score
+  , scorecalc AS (
+      SELECT
+          scorecomp.*,
+
+          -- 1. Respiration
+          CASE
+              WHEN pao2fio2ratio_vent < 100 THEN 4
+              WHEN pao2fio2ratio_vent < 200 THEN 3
+              WHEN pao2fio2ratio_novent < 300 THEN 2
+              WHEN pao2fio2ratio_vent < 300 THEN 2
+              WHEN pao2fio2ratio_novent < 400 THEN 1
+              WHEN pao2fio2ratio_vent < 400 THEN 1
+              WHEN COALESCE(pao2fio2ratio_vent, pao2fio2ratio_novent) IS NULL 
+              THEN NULL
+              ELSE 0
+          END AS respiration,
+
+          -- 2. Coagulation
+          CASE
+              WHEN platelet_min < 20 THEN 4
+              WHEN platelet_min < 50 THEN 3
+              WHEN platelet_min < 100 THEN 2
+              WHEN platelet_min < 150 THEN 1
+              WHEN platelet_min IS NULL THEN NULL
+              ELSE 0
+          END AS coagulation,
+
+          -- 3. Liver - Bilirubin in mg/dL
+          CASE
+              WHEN bilirubin_max >= 12.0 THEN 4
+              WHEN bilirubin_max >= 6.0 THEN 3
+              WHEN bilirubin_max >= 2.0 THEN 2
+              WHEN bilirubin_max >= 1.2 THEN 1
+              WHEN bilirubin_max IS NULL THEN NULL
+              ELSE 0
+          END AS liver,
+
+          -- 4. Cardiovascular
+          CASE
+              WHEN rate_dopamine > 15 
+                  OR rate_epinephrine > 0.1 
+                  OR rate_norepinephrine > 0.1 
+              THEN 4
+              WHEN rate_dopamine > 5 
+                  OR rate_epinephrine <= 0.1 
+                  OR rate_norepinephrine <= 0.1 
+              THEN 3
+              WHEN rate_dopamine > 0 
+                  OR rate_dobutamine > 0 
+              THEN 2
+              WHEN meanbp_min < 70 THEN 1
+              WHEN COALESCE(
+                  meanbp_min, 
+                  rate_dopamine, 
+                  rate_dobutamine, 
+                  rate_epinephrine, 
+                  rate_norepinephrine
+              ) IS NULL THEN NULL
+              ELSE 0
+          END AS cardiovascular,
+
+          -- 5. CNS (Central Nervous System) - GCS
+          CASE
+              WHEN (gcs_min >= 13 AND gcs_min <= 14) THEN 1
+              WHEN (gcs_min >= 10 AND gcs_min <= 12) THEN 2
+              WHEN (gcs_min >= 6 AND gcs_min <= 9) THEN 3
+              WHEN gcs_min < 6 THEN 4
+              WHEN gcs_min IS NULL THEN NULL
+              ELSE 0
+          END AS cns,
+
+          -- 6. Renal - Creatinine or Urine output
+          CASE
+              WHEN creatinine_max >= 5.0 THEN 4
+              WHEN uo_24hr < 200 THEN 4
+              WHEN (creatinine_max >= 3.5 AND creatinine_max < 5.0) THEN 3
+              WHEN uo_24hr < 500 THEN 3
+              WHEN (creatinine_max >= 2.0 AND creatinine_max < 3.5) THEN 2
+              WHEN (creatinine_max >= 1.2 AND creatinine_max < 2.0) THEN 1
+              WHEN COALESCE(uo_24hr, creatinine_max) IS NULL THEN NULL
+              ELSE 0
+          END AS renal
+          
+      FROM scorecomp
+  )
+
+  -- Step 13: Get maximum values in 24-hour window
+  -- Combine all the scores to get SOFA
+  -- Impute 0 if the score is missing
+  -- the window function takes the max over the last 24 hours
+  , score_final AS (
+      SELECT
+          s.*,
+
+          -- Maximum value for each component within 24 hours
+          COALESCE(
+              MAX(respiration) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS respiration_24hours,
+          
+          COALESCE(
+              MAX(coagulation) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS coagulation_24hours,
+          
+          COALESCE(
+              MAX(liver) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS liver_24hours,
+          
+          COALESCE(
+              MAX(cardiovascular) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS cardiovascular_24hours,
+          
+          COALESCE(
+              MAX(cns) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS cns_24hours,
+          
+          COALESCE(
+              MAX(renal) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS renal_24hours,
+
+          -- Total SOFA score
+          COALESCE(
+              MAX(respiration) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) +
+          COALESCE(
+              MAX(coagulation) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) +
+          COALESCE(
+              MAX(liver) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) +
+          COALESCE(
+              MAX(cardiovascular) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) +
+          COALESCE(
+              MAX(cns) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) +
+          COALESCE(
+              MAX(renal) OVER (
+                  PARTITION BY stay_id 
+                  ORDER BY hr 
+                  ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+              ), 0
+          ) AS sofa_24hours
+          
+      FROM scorecalc s
+  )
+
+  -- Final output (only main columns matching original project format)
+  SELECT
+      stay_id,
+      hr,
+      bilirubin_max,
+      respiration,coagulation, liver,cardiovascular,cns,renal,
+      uo_24hr,
+      respiration_24hours,
+      coagulation_24hours,
+      liver_24hours,
+      cardiovascular_24hours,
+      cns_24hours,
+      renal_24hours,
+      sofa_24hours
+  FROM score_final
+  WHERE hr >= 0
+")
+
+cat("✓ derive_sofa table created\n")
+cat("  Base: person_hourly_with_crrt\n")
+cat("  Ventilation determination: invasive_noninvasive_highflow\n")
+```
+
+
+
+## Step 20: Create derive_sepsis3
+
+### Purpose
+Apply Sepsis-3 diagnostic criteria:
+- **Sepsis = Suspected infection + SOFA ≥2**
+- Evaluate SOFA score in the window 48 hours before to 24 hours after suspected infection time
+
+### Prerequisites
+- derived_suspicion_of_infection (created in Step 17)
+- derive_sofa (created in Step 18)
+
+### Sepsis-3 definition (official)
+1. **Suspected infection**: Temporal relationship between antibiotic administration and culture
+2. **Organ dysfunction**: SOFA ≥2 (baseline assumed to be 0)
+3. **Evaluation period**: 48 hours before to 24 hours after suspected infection time
+
+
+
+```{r step19-create-sepsis3}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Step 20: Create derive_sepsis3 (following official sepsis3.sql)\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+cat("\n[Sepsis-3 diagnostic criteria]\n")
+cat("1. Suspected infection (suspected_infection = 1)\n")
+cat("2. SOFA score ≥2 (baseline assumed to be 0)\n")
+cat("3. Evaluation period: 48 hours before to 24 hours after suspected infection time\n\n")
+
+# Create Sepsis-3 diagnosis table
+dbExecute(con, "
+  CREATE OR REPLACE TABLE derive_sepsis3 AS
+
+  -- Step 1: Extract rows with SOFA >= 2 (calculate time)
+  WITH sofa AS (
+      SELECT 
+          s.stay_id,
+          s.hr,
+          -- starttime: intime + (hr-1) hours
+          i.intime + CAST(((s.hr - 1) * 3600) AS INTEGER) * INTERVAL '1' SECOND AS starttime,
+          -- endtime: intime + hr hours
+          i.intime + CAST((s.hr * 3600) AS INTEGER) * INTERVAL '1' SECOND AS endtime,
+          s.respiration_24hours AS respiration,
+          s.coagulation_24hours AS coagulation,
+          s.liver_24hours AS liver,
+          s.cardiovascular_24hours AS cardiovascular,
+          s.cns_24hours AS cns,
+          s.renal_24hours AS renal,
+          s.sofa_24hours AS sofa_score
+      FROM derive_sofa s
+      LEFT JOIN icu_stays_base i ON s.stay_id = i.stay_id
+      WHERE s.sofa_24hours >= 2
+  )
+
+  -- Step 2: Join suspected infection with SOFA
+  , s1 AS (
+      SELECT
+          soi.subject_id,
+          soi.stay_id,
+          -- Suspected infection information
+          soi.ab_id,
+          soi.antibiotic,
+          soi.antibiotic_time,
+          soi.culture_time,
+          soi.suspected_infection,
+          soi.suspected_infection_time,
+          soi.specimen,
+          soi.positive_culture,
+          -- SOFA information
+          sofa.starttime,
+          sofa.endtime,
+          sofa.respiration,
+          sofa.coagulation,
+          sofa.liver,
+          sofa.cardiovascular,
+          sofa.cns,
+          sofa.renal,
+          sofa.sofa_score,
+          -- Sepsis-3 determination
+          -- SOFA >= 2 and suspected infection present
+          -- Baseline SOFA assumed to be 0
+          (sofa.sofa_score >= 2 AND soi.suspected_infection = 1) AS sepsis3,
+          -- Select first sepsis3 event
+          ROW_NUMBER() OVER (
+              PARTITION BY soi.stay_id
+              ORDER BY
+                  soi.suspected_infection_time,
+                  soi.antibiotic_time,
+                  soi.culture_time,
+                  sofa.endtime
+          ) AS rn_sus
+      FROM derived_suspicion_of_infection AS soi
+      INNER JOIN sofa
+          ON soi.stay_id = sofa.stay_id
+          -- 48 hours before to 24 hours after suspected infection time
+          AND sofa.endtime >= soi.suspected_infection_time - INTERVAL '48' HOUR
+          AND sofa.endtime <= soi.suspected_infection_time + INTERVAL '24' HOUR
+      -- Only rows within ICU
+      WHERE soi.stay_id IS NOT NULL
+  )
+
+  -- Step 3: Select only first sepsis3 event
+  SELECT
+      subject_id,
+      stay_id,
+      -- Suspected infection information
+      antibiotic_time,
+      culture_time,
+      suspected_infection_time,
+      -- SOFA information (endtime = latest time SOFA score is valid)
+      endtime AS sofa_time,
+      sofa_score,
+      respiration,
+      coagulation,
+      liver,
+      cardiovascular,
+      cns,
+      renal,
+      -- Sepsis-3 determination
+      sepsis3
+  FROM s1
+  WHERE rn_sus = 1
+")
+
+cat("✓ derive_sepsis3 table created\n")
+cat("  Evaluation period: 48 hours before to 24 hours after suspected infection time\n")
+cat("  Baseline SOFA: Assumed to be 0\n")
+```
+
+
+
+## File 02 end processing
+
+
+
+## Check created tables
+
+```{r final-table-check}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Check tables created in File 02\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# 作成したテーブル一覧
+created_tables <- c(
+  "ventilation_hourly",
+  "person_hourly_with_vent",
+  "fio2_forward_filled",
+  "person_hourly_with_fio2",
+  "drugs_hourly",
+  "person_hourly_with_drugs",
+  "vitalsign_hourly",
+  "person_hourly_with_vitals",
+  "oxygen_hourly",
+  "person_hourly_with_o2flow",
+  "abg_hourly",
+  "person_hourly_with_abg",
+  "chemistry_hourly",
+  "person_hourly_with_labs",
+  "cbc_hourly",
+  "person_hourly_with_cbc",
+  "crrt_hourly",
+  "person_hourly_with_crrt",
+  "derive_sofa",
+  "derive_sepsis3"
+)
+
+# Check existence and row count for each table
+table_summary <- data.frame(
+  No = integer(),
+  Table_Name = character(),
+  Exists = character(),
+  Row_Count = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(created_tables)) {
+  tbl <- created_tables[i]
+  exists <- tbl %in% dbListTables(con)
+
+  if (exists) {
+    count <- dbGetQuery(con, sprintf("SELECT COUNT(*) as cnt FROM %s", tbl))
+    row_count <- format(count$cnt, big.mark = ",")
+    status <- "✓"
+  } else {
+    row_count <- "-"
+    status <- "✗"
+  }
+
+  table_summary <- rbind(
+    table_summary,
+    data.frame(
+      No = i,
+      Table_Name = tbl,
+      Exists = status,
+      Row_Count = row_count,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+cat("\n[List of created tables]\n")
+print(table_summary, row.names = FALSE)
+
+cat("\nTotal:", sum(table_summary$Exists == "✓"), "/",
+    length(created_tables), "tables\n")
+```
+
+
+
+## Final statistics summary
+
+```{r final-summary}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("File 02 final statistics summary\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# person_hourly_with_crrt (final base table)
+final_base <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_observations,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      COUNT(DISTINCT subject_id) as unique_subjects,
+      MIN(hr) as min_hr,
+      MAX(hr) as max_hr
+  FROM person_hourly_with_crrt
+")
+
+cat("\n[Final base table: person_hourly_with_crrt]\n")
+print(final_base)
+
+# derive_sofa statistics
+sofa_summary <- dbGetQuery(con, "
+  SELECT
+      COUNT(DISTINCT stay_id) as patients_with_sofa,
+      ROUND(AVG(sofa_24hours), 2) as mean_sofa,
+      ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sofa_24hours), 1) as median_sofa,
+      MAX(sofa_24hours) as max_sofa
+  FROM derive_sofa
+")
+
+cat("\n[SOFA score statistics]\n")
+print(sofa_summary)
+
+# derive_sepsis3 statistics
+sepsis3_summary <- dbGetQuery(con, "
+  SELECT
+      COUNT(*) as total_infection_episodes,
+      COUNT(DISTINCT stay_id) as unique_patients,
+      SUM(CASE WHEN sepsis3 = TRUE THEN 1 ELSE 0 END) as sepsis3_cases,
+      ROUND(
+          SUM(CASE WHEN sepsis3 = TRUE THEN 1 ELSE 0 END) * 100.0 / COUNT(*),
+          2
+      ) as sepsis3_percentage
+  FROM derive_sepsis3
+")
+
+cat("\n[Sepsis-3 diagnosis statistics]\n")
+print(sepsis3_summary)
+
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+```
+
+
+
+## Save database and close connection
+
+```{r disconnect-database}
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("Close database connection\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Display database path
+db_path <- "C:/Users/ryohe/Dropbox (個人)/Research/mimic_projects/mimic_analysis/data/mimic.duckdb"
+cat("\nDatabase:", db_path, "\n")
+
+# Close connection (save changes)
+tryCatch({
+  dbDisconnect(con, shutdown = TRUE)
+  cat("✓ Database connection closed successfully\n")
+  cat("✓ All changes saved\n")
+}, error = function(e) {
+  cat("⚠️ Error occurred while closing connection:", e$message, "\n")
+})
+
+# Clean up memory
+rm(con)
+gc()
+
+cat("\n")
+cat("=", rep("=", 60), "\n", sep = "")
+cat("File 02 completed\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+cat("\n[Completed processes]\n")
+cat("✓ Step 9: Time-axis conversion of respiratory data\n")
+cat("✓ Step 10: FiO2 data extraction and Forward Filling\n")
+cat("✓ Step 11: Vasopressor and inotrope data extraction\n")
+cat("✓ Step 12: Vital signs data extraction\n")
+cat("✓ Step 13: O2 flow data extraction\n")
+cat("✓ Step 14: ABG, Chemistry, CBC data extraction\n")
+cat("✓ Step 15: CRRT data extraction\n")
+cat("✓ Step 16: GCS data extraction\n")
+cat("✓ Step 17: Derived table creation\n")
+cat("✓ Step 18: Suspicion of Infection\n")
+cat("✓ Step 19: SOFA Score calculation\n")
+cat("✓ Step 20: Sepsis-3 diagnosis\n")
+
+cat("\n[Next steps]\n")
+cat("You can perform analysis in File 03\n")
+cat("\n")
+```
+
+
+
+
+
+
+
