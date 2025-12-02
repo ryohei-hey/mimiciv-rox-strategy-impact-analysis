@@ -1,21 +1,24 @@
 # Impact-Analaysis-of-simple-prediction-model
-# Title: Impact study of ROX index (simple prediction model) using MIMIC-IV. 
+
+# SHort Title: Impact study of ROX index (simple prediction model) using MIMIC-IV. 
 
 # Aim
 The aim is to estimate the causal effect of a ROX-guided (simple prediction model-guided) strategy compared with usual care on 30-day mortality among adults who have been initiated on high flow nasal cannula (HFNC) for respiratory failure.
 
 # Introduction  
-The ROX index is a widely validated tool for predicting HFNC failure and has been proposed to support decisions regarding early intubation for patients with respiratory failure. The ROX index is defined as (SpO₂/FiO₂)/respiratory rate, and its predictive performance has been externaly validated across diverse diseases and care settings. However, whether using the ROX index to guide intubation decisions improves patient outcomes remains unknown. Prediction alone does not imply causation, and prognostic accuracy does not guarantee clinical utility. For use in routine care, prediction models require impact analysis, which evaluates whether model-guided decisions improve outcomes compared with usual practice. A target trial emulation (TTE) is well suited to this question because the treatment strategies—ROX-guided intubation versus usual care—can be clearly defined at HFNC initiation and aligned with routinely collected ICU data, thereby avoiding design-related biases such as immortal time bias. As no randomized trial has evaluated a ROX-guided intubation strategy among HFNC recipients, robust causal evidence derived from observational data is needed.
+The ROX index is a widely validated tool for predicting High flow nasal canula (HFNC) failure and has been proposed to support decisions regarding early intubation for patients with respiratory failure. The ROX index is defined as (SpO₂/FiO₂)/respiratory rate, and its predictive performance has been externaly validated across diverse diseases and care settings. However, whether using the ROX index to guide intubation decisions improves patient outcomes remains unknown. Prediction alone does not imply causation, and prognostic accuracy does not guarantee clinical utility. For use in routine care, prediction models require impact analysis, which evaluates whether model-guided decisions improve outcomes compared with usual practice. A target trial emulation (TTE) is well suited to this question because the treatment strategies—ROX-guided intubation versus usual care—can be clearly defined at HFNC initiation and aligned with routinely collected ICU data, thereby avoiding design-related biases such as immortal time bias. As no randomized trial has evaluated a ROX-guided intubation strategy among HFNC recipients, robust causal evidence derived from observational data is needed.
 
 # PICO
-P:
-I:
-C:
-O: 
+P: ICU patients on HFNC
+I: ROX guided intubation strategy
+C: Usual care (physician decsision making) 
+O: 30 day mortality
+Follow up start/end: HFNC initiated (not ICU admission) to 30 days (720 hr)
   
 # Analysis Steps  
-- Step1: Extracting person hourly data from MIMIC-IV
-- Step2: DataWrangling  
+- Step0: Construct DuckDB (MIMIC-IV v3.1)  
+- Step1: Extracting person hourly data
+- Step2: Data cleaning  
 - Step3: Imputation  
 - Step4: Clone Censor Weighting analysis   
   
@@ -62,14 +65,15 @@ Cohort selection and construction of basic person-hourly data structure
 | 8 | Censor data after death |
 
 ### Inclusion Criteria
-- First ICU admission only
-- Age 18-85 years
-- Exclude Neuro ICU patients
+- HFNC initiated  
+- First ICU admission only  
+- Age 18-85 years  
+- Non-neurological ICU  
 
 ### Exclusion Criteria
-1. HFNC started >1 hours before ICU admission
-2. Invasive ventilation before HFNC
-3. DNR/DNI/CMO status before HFNC initiation
+1. HFNC started >1 hours before ICU admission (allow patients who start HFNC therapy in ED or are initiated on HFNC to be transferred to ICU) 
+2. Invasive ventilation before HFNC (Post extubation use were excluded)
+3. DNR/DNI/CMO status before HFNC initiation (Any patients with treatment limitation was excluded)
 4. Death before HFNC initiation
 
 ### Output Tables
