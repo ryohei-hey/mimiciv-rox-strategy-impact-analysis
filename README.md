@@ -22,8 +22,52 @@ Follow up start/end: HFNC initiated (not ICU admission) to 30 days (720 hr)
 - Step3: Imputation  
 - Step4: Clone Censor Weighting analysis   
   
+# Step1  
+## Goal - Person-Hourly Data Structure  
+  
+This project uses a **person-hourly data structure**, where each row represents one patient at one specific hour. This format enables time-to-event analysis with time-varying covariates.
 
-# File Contets
+### Example Data
+
+| stay_id | hr | time | heart_rate | spo2 | fio2 | highflow |
+|---------|-----|------|------------|------|------|----------|
+| 101 | 0 | -6 | 88 | 94 | 40 | 0 |
+| 101 | 1 | -5 | 90 | 93 | 40 | 0 |
+| 101 | ... | ... | ... | ... | ... | ... |
+| 101 | 6 | **0** | 92 | 91 | 60 | **1** |
+| 101 | 7 | 1 | 88 | 93 | 55 | 1 |
+
+*Note: `time = 0` indicates HFNC initiation*
+
+### Two Time Axes
+
+| Variable | Reference Point | Description |
+|----------|-----------------|-------------|
+| `hr` | ICU admission | Hours since ICU admission (always starts at 0) |
+| `time` | HFNC initiation | Hours relative to HFNC start (negative = before, positive = after) |
+
+### Advantages
+
+- Suitable for **time-to-event analysis** (survival analysis)
+- Captures **time-varying covariates** (vitals, labs, treatments) at each hour
+- Enables **target trial emulation** with time-dependent exposures
+
+### Final Dataset Size
+
+~1,771 patients × ~700 hours ≈ **1+ million rows**
+## HTML files  
+If you see files through html, please click below URL  
+  
+- 01_Basic_hourly_data  
+https://www.dropbox.com/scl/fi/d6b122q29q1ix5m8ozl9u/01_Basic_hourly_data.html?rlkey=pi460cscx7bap6xlbxp4ckqm0&st=803cxi45&dl=0  
+  
+- 02_time_varying_variables  
+https://www.dropbox.com/scl/fi/3fwcnznqbz2dc6eyymjt1/02_time_varying_variables.html?rlkey=v6u4wemluzk9zzs1amsm5iuql&st=seee0p2r&dl=0  
+  
+03_final_integration  
+https://www.dropbox.com/scl/fi/9u9wqh4jy1m1n199g5qif/03_final_integration.html?rlkey=g5owfpbw34fieio6w1s1mcuap&st=3jnu3wa8&dl=0  
+  
+## File Contets
 ## Overview
 
 A three-part data processing pipeline for Target Trial Emulation of High Flow Nasal Cannula (HFNC) treatment outcomes in ICU patients. Processes MIMIC-IV database using DuckDB with 30-day mortality as the primary outcome.
