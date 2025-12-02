@@ -13,12 +13,12 @@ I:
 C:
 O: 
   
-# Analysis Steps
-Step1: Extracting person hourly data from MIMIC-IV  
-Step2: DataWrangling  
-Step3: Imputation  
-Step4: Clone Censor Weighting analysis   
-
+# Analysis Steps  
+- Step1: Extracting person hourly data from MIMIC-IV
+- Step2: DataWrangling  
+- Step3: Imputation  
+- Step4: Clone Censor Weighting analysis   
+  
 
 # File Contets
 ## Overview
