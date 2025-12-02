@@ -14,10 +14,10 @@ C:
 O: 
   
 # Analysis Steps
-Step1: Extracting person hourly data from MIMIC-IV
-Step2: DataWrangling
-Step3: Imputation
-Step4: Clone Censor Weighting analysis 
+Step1: Extracting person hourly data from MIMIC-IV  
+Step2: DataWrangling  
+Step3: Imputation  
+Step4: Clone Censor Weighting analysis   
 
 
 # File Contets
@@ -30,7 +30,7 @@ A three-part data processing pipeline for Target Trial Emulation of High Flow Na
 **MIMIC-IV Database
 **
 - Downloaded from PhysioNet (credentialed access required)
-- Version: MIMIC-IV v2.x
+- Version: MIMIC-IV v3.1
 - Modules used: hosp, icu
 
 **DuckDB Setup
