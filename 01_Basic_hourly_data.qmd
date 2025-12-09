@@ -938,7 +938,7 @@ cat(sprintf("  Exclude Neuro ICU: %s (Excluded: %s)\n\n",
             format(flow$excluded_neuro_icu, big.mark=",")))
 
 cat("Exclusion Criteria\n")
-cat(sprintf("  1. HFNC start before -6 hours: Excluded %s\n",
+cat(sprintf("  1. HFNC start before -1 hours: Excluded %s\n",
             format(flow$excluded_early_hfnc, big.mark=",")))
 cat(sprintf("  2. Invasive ventilation within 24h before HFNC: Excluded %s\n",
             format(flow$excluded_invasive_24h, big.mark=",")))
@@ -1218,4 +1218,5 @@ gc()
 cat("✓ Closed DuckDB connection\n")
 cat("✓ Freed memory\n")
 ```
+
 
