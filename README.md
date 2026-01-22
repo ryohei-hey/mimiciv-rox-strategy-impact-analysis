@@ -8,12 +8,12 @@ The aim is to estimate the causal effect of a ROX-guided (simple prediction mode
 The ROX index is a widely validated tool for predicting High flow nasal canula (HFNC) failure and has been proposed to support decisions regarding early intubation for patients with respiratory failure. The ROX index is defined as (SpO₂/FiO₂)/respiratory rate, and its predictive performance has been externaly validated across diverse diseases and care settings. However, whether using the ROX index to guide intubation decisions improves patient outcomes remains unknown. Prediction alone does not imply causation, and prognostic accuracy does not guarantee clinical utility. For use in routine care, prediction models require impact analysis, which evaluates whether model-guided decisions improve outcomes compared with usual practice. A target trial emulation (TTE) is well suited to this question because the treatment strategies—ROX-guided intubation versus usual care—can be clearly defined at HFNC initiation and aligned with routinely collected ICU data, thereby avoiding design-related biases such as immortal time bias. As no randomized trial has evaluated a ROX-guided intubation strategy among HFNC recipients, robust causal evidence derived from observational data is needed.
 
 # PICO
-P: ICU patients on HFNC
-I: ROX guided intubation strategy
-C: Usual care (physician decsision making) 
-O: 30 day mortality
-Follow up start/end: HFNC initiated (not ICU admission) to 30 days (720 hr)
-  
+P: ICU patients on HFNC  
+I: ROX guided intubation strategy  
+C: Usual care (physician decsision making)   
+O: 30 day mortality  
+Follow up start/end: HFNC initiated (not ICU admission) to 30 days (720 hr)  
+    
 # Analysis Steps  
 - Step0: Construct DuckDB (MIMIC-IV v3.1)  
 - Step1: Extracting person hourly data
