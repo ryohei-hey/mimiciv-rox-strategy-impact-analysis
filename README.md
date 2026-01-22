@@ -1,6 +1,5 @@
-# Impact-Analaysis-of-simple-prediction-model
-
-# SHort Title: Impact study of ROX index (simple prediction model) using MIMIC-IV. 
+This repository provides reproducible code for an impact analysis framework that evaluates prediction scores as clinical strategies (model-guided policies) using target trial emulation with time-updated ICU data.
+We demonstrate the approach by comparing ROX-guided intubation strategies versus usual care after HFNC initiation in MIMIC-IV.
 
 # Aim
 The aim is to estimate the causal effect of a ROX-guided (simple prediction model-guided) strategy compared with usual care on 30-day mortality among adults who have been initiated on high flow nasal cannula (HFNC) for respiratory failure.
