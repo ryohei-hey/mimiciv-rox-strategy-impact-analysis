@@ -20,7 +20,13 @@ Follow up start/end: HFNC initiated (not ICU admission) to 30 days (720 hr)
 - Step2: Data cleaning  
 - Step3: Imputation  
 - Step4: Clone Censor Weighting analysis   
-  
+
+# Step0  
+## Construct DuckDB (MIMIC-IV v3.1)
+Please see instruction in below URL to build local DuckDB database from MIMIC-IV CSV/Parquet files.
+
+https://github.com/MIT-LCP/mimic-code/tree/main/mimic-iv/concepts_duckdb
+
 # Step1  
 ## Goal - Person-Hourly Data Structure  
   
